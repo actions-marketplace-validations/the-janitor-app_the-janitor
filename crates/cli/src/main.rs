@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod audit_report;
 mod campaign_ingest;
 mod cbom;
 mod ci_telemetry;
@@ -19,8 +20,11 @@ mod export;
 mod git_drive;
 mod hunt;
 mod jira;
+mod nuclei_templates;
+mod registry_watch_cmd;
 mod report;
 mod sarif_enterprise;
+mod submit_formatter;
 mod verify_asset;
 mod warg_client;
 
@@ -98,6 +102,33 @@ fn build_ureq_agent(policy: &common::policy::JanitorPolicy) -> anyhow::Result<ur
         .tls_config(tls_config)
         .build()
         .new_agent())
+}
+
+fn cmd_chronovisor(target: &Path, finding_id: &str) -> anyhow::Result<()> {
+    let findings = hunt::scan_directory(target).with_context(|| {
+        format!(
+            "scan target {} for Chronovisor seed finding",
+            target.display()
+        )
+    })?;
+    let finding = findings
+        .into_iter()
+        .find(|finding| finding.id == finding_id)
+        .with_context(|| format!("finding `{finding_id}` was not detected at HEAD"))?;
+
+    let chronovisor = anatomist::chronovisor::Chronovisor::open(target)?;
+    let Some(origin) = chronovisor.first_introduction(&finding)? else {
+        anyhow::bail!(
+            "finding `{}` is present at HEAD but no historical origin commit was identified",
+            finding.id
+        );
+    };
+
+    println!("finding_id={}", finding.id);
+    println!("origin_commit={}", origin.commit_sha);
+    println!("timestamp_unix={}", origin.timestamp_unix);
+    println!("offset_minutes={}", origin.offset_minutes);
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -267,7 +298,7 @@ enum Commands {
         /// Patterns are matched against directory name components of each file path.
         #[arg(long, default_values = ["thirdparty/", "vendor/", "node_modules/", "target/"])]
         exclude: Vec<String>,
-        /// [DANGEROUS] Bypass the C++/C#/GLSL dedup safety hard-gate.
+        /// DANGEROUS: Bypass the C++/C#/GLSL dedup safety hard-gate.
         ///
         /// By default, dedup --apply refuses to rewrite C++, C, header, C#, and GLSL
         /// files to prevent SIMD/template corruption. This flag disables that gate.
@@ -509,7 +540,7 @@ enum Commands {
     Badge {
         /// Project root (reads .janitor/symbols.rkyv).
         path: PathBuf,
-        /// Output path for the SVG file. Default: <path>/.janitor/badge.svg.
+        /// Output path for the SVG file. Default: `<project-root>/.janitor/badge.svg`.
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -626,11 +657,56 @@ enum Commands {
         /// the KEV catalog across runs without parsing binary rkyv data.
         #[arg(long, default_value_t = false)]
         ci_mode: bool,
+        /// Fetch ONLY the CISA KEV catalog and write `.janitor/wisdom_manifest.json`.
+        ///
+        /// Skips the wisdom.rkyv binary-registry mirror sync entirely.  The weekly
+        /// KEV diff PR workflow only needs the JSON manifest, so coupling it to a
+        /// possibly-undeployed wisdom.rkyv mirror was a fragility.  Mutually
+        /// exclusive with `--ci-mode` (which performs the full strict sync).
+        #[arg(long, default_value_t = false, conflicts_with = "ci_mode")]
+        kev_manifest_only: bool,
     },
     /// Synchronize the OSV malicious-package corpus into `.janitor/slopsquat_corpus.rkyv`.
     UpdateSlopsquat {
         /// Project root (writes .janitor/slopsquat_corpus.rkyv).
         path: PathBuf,
+    },
+    /// Poll live registry feeds (npm / crates.io / pypi) and append scored
+    /// candidates to `.janitor/registry_watch_queue.ndjson`.
+    WatchRegistries {
+        /// Which registry to poll: `npm`, `crates`, `pypi`, or `all`.
+        #[arg(long, default_value = "all")]
+        registry: String,
+        /// Run a single poll cycle and exit (no continuous loop).
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Project root (writes .janitor/registry_watch_queue.ndjson).
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Optional newline-separated popular-packages override file.
+        #[arg(long)]
+        popular_list: Option<PathBuf>,
+        /// Print findings to stdout as NDJSON without writing to the queue.
+        /// Safe for CI pipelines where side-effects are forbidden.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Skip packages with a `published_at` timestamp older than this many
+        /// hours. Prevents re-triaging already-seen packages on repeated CI runs.
+        #[arg(long, default_value_t = 24)]
+        max_age_hours: u64,
+    },
+    /// Read `.janitor/registry_watch_queue.ndjson` and render entries
+    /// above `--min-score` as text or markdown.
+    TriageRegistryQueue {
+        /// Minimum score to include in output.
+        #[arg(long, default_value_t = 60)]
+        min_score: i32,
+        /// Output format: `text` or `markdown`.
+        #[arg(long, default_value = "text")]
+        render: String,
+        /// Project root (reads .janitor/registry_watch_queue.ndjson).
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
     },
     /// Parse offline campaign markdown into a ranked target ledger.
     IngestCampaigns {
@@ -742,14 +818,14 @@ enum Commands {
         repo: PathBuf,
     },
 
-    /// [INTERNAL] Print a one-line clinical engine health summary.
+    /// INTERNAL: Print a one-line clinical engine health summary.
     ///
     /// Intended for operator use during incident triage or after environment
     /// disruptions.  Not listed in `--help` output.
     #[command(hide = true)]
     OperatorStatus,
 
-    /// [INTERNAL] Controlled Conflict Simulation — verify the lockfile silo detector fires correctly.
+    /// INTERNAL: Controlled Conflict Simulation — verify the lockfile silo detector fires correctly.
     ///
     /// Generates a synthetic `Cargo.lock` containing two versions of `serde`, runs
     /// [`anatomist::manifest::find_version_silos_from_lockfile`] against it, and
@@ -760,7 +836,7 @@ enum Commands {
     #[command(hide = true)]
     DebugSilo,
 
-    /// [INTERNAL] Sovereign Integrity Audit — verify the engine intercepts its own synthetic threats.
+    /// INTERNAL: Sovereign Integrity Audit — verify the engine intercepts its own synthetic threats.
     ///
     /// Executes a Ghost Attack: injects a cryptominer string and a version silo into
     /// synthetic diff/manifest fixtures and verifies the engine flags them with the
@@ -771,7 +847,7 @@ enum Commands {
     #[command(hide = true)]
     SelfTest,
 
-    /// [INTERNAL] Emit a GitHub Actions Step Summary dashboard for the last bounce result.
+    /// INTERNAL: Emit a GitHub Actions Step Summary dashboard for the last bounce result.
     ///
     /// Reads the most recent entry from `.janitor/bounce_log.ndjson` and prints a
     /// high-density Markdown dashboard to stdout.  Append the output to
@@ -1153,6 +1229,43 @@ enum Commands {
         /// `--format bugcrowd` is also set.  Fails gracefully when the token is absent.
         #[arg(long, default_value_t = false)]
         submit: bool,
+        /// Cross-reference every finding against the program's scope rules in
+        /// `tools/campaign/targets/<program>_targets.md`, emit `[SCOPE: IN]` /
+        /// `[SCOPE: OUT]` labels to stderr, and write `SUBMISSION_<id>.md` for
+        /// every in-scope finding with a populated `repro_cmd`.
+        #[arg(long, default_value_t = false)]
+        submit_check: bool,
+    },
+
+    /// Generate a professional Markdown security audit report for a target repository.
+    ///
+    /// Runs the full hunt pipeline (taint, IDOR, authz, solidity, FFI, credentials) and
+    /// emits a structured PDF-ready Markdown document: Executive Summary, Findings Table,
+    /// Per-Finding Technical Detail, and a SHA-384 provenance attestation statement.
+    ///
+    /// # Examples
+    /// ```text
+    /// # Audit a local clone and write audit_report.md to ./reports/
+    /// janitor audit-report ./uniswap-v3-core --output ./reports
+    /// ```
+    AuditReport {
+        /// Path to the repository to audit.
+        repo: PathBuf,
+        /// Output directory for the generated Markdown report.
+        #[arg(long, default_value = ".")]
+        output: PathBuf,
+    },
+
+    /// Identify the first historical commit where a finding appears.
+    ///
+    /// Scans `TARGET` at `HEAD`, selects the first finding whose `id` matches
+    /// `FINDING_ID`, then replays that detector across git history to emit the
+    /// origin commit and commit timestamp.
+    Chronovisor {
+        /// Path to the repository root to analyze.
+        target: PathBuf,
+        /// Structured finding ID, e.g. `security:unsafe_string_function`.
+        finding_id: String,
     },
 
     /// Deploy a Labyrinth deception forest to exhaust adversarial AI agent context windows.
@@ -1381,28 +1494,28 @@ async fn main() -> anyhow::Result<()> {
             let timeout_pr_number = pr_number.or(scm_context.pr_number);
 
             let task = tokio::task::spawn_blocking(move || {
-                cmd_bounce(
-                    &path,
-                    patch.as_deref(),
-                    registry.as_deref(),
-                    &format,
-                    repo.as_deref(),
-                    base.as_deref(),
-                    head.as_deref(),
+                cmd_bounce(BounceConfig {
+                    project_root: &path,
+                    patch_file: patch.as_deref(),
+                    registry_override: registry.as_deref(),
+                    format: &format,
+                    repo: repo.as_deref(),
+                    base: base.as_deref(),
+                    head: head.as_deref(),
                     pr_number,
-                    author.as_deref(),
-                    pr_body.as_deref(),
-                    repo_slug.as_deref(),
-                    pr_state.as_str(),
-                    governor_url.as_deref(),
-                    analysis_token.as_deref(),
-                    head_sha.as_deref(),
-                    soft_fail,
-                    deep_scan,
-                    pqc_key.as_deref(),
-                    &wasm_rules,
-                    &execution_tier,
-                )
+                    author: author.as_deref(),
+                    pr_body: pr_body.as_deref(),
+                    repo_slug: repo_slug.as_deref(),
+                    pr_state_str: pr_state.as_str(),
+                    governor_url: governor_url.as_deref(),
+                    analysis_token: analysis_token.as_deref(),
+                    head_sha: head_sha.as_deref(),
+                    soft_fail_flag: soft_fail,
+                    deep_scan_flag: deep_scan,
+                    pqc_key: pqc_key.as_deref(),
+                    wasm_rules_flag: &wasm_rules,
+                    execution_tier: &execution_tier,
+                })
             });
 
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
@@ -1510,8 +1623,38 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| path.join(".janitor").join("symbols.rkyv"));
             daemon::unix::serve(std::path::Path::new(socket), &registry_path).await?;
         }
-        Commands::UpdateWisdom { path, ci_mode } => cmd_update_wisdom(path, *ci_mode)?,
+        Commands::UpdateWisdom {
+            path,
+            ci_mode,
+            kev_manifest_only,
+        } => {
+            if *kev_manifest_only {
+                cmd_update_wisdom_kev_manifest_only(path)?;
+            } else {
+                cmd_update_wisdom(path, *ci_mode)?;
+            }
+        }
         Commands::UpdateSlopsquat { path } => cmd_update_slopsquat(path, &execution_tier)?,
+        Commands::WatchRegistries {
+            registry,
+            once,
+            project_root,
+            popular_list,
+            dry_run,
+            max_age_hours,
+        } => registry_watch_cmd::cmd_watch_registries(
+            registry,
+            *once,
+            project_root,
+            popular_list.as_deref(),
+            *dry_run,
+            *max_age_hours,
+        )?,
+        Commands::TriageRegistryQueue {
+            min_score,
+            render,
+            project_root,
+        } => registry_watch_cmd::cmd_triage_registry_queue(*min_score, render, project_root)?,
         Commands::IngestCampaigns { dir } => campaign_ingest::cmd_ingest_campaigns(dir)?,
         Commands::Export {
             repo,
@@ -1667,6 +1810,7 @@ async fn main() -> anyhow::Result<()> {
             live_tenant_domain,
             live_tenant_client_id,
             submit,
+            submit_check,
         } => {
             hunt::cmd_hunt(hunt::HuntArgs {
                 scan_root: path.as_deref(),
@@ -1686,7 +1830,14 @@ async fn main() -> anyhow::Result<()> {
                 live_tenant_domain: live_tenant_domain.as_deref(),
                 live_tenant_client_id: live_tenant_client_id.as_deref(),
                 submit: *submit,
+                submit_check: *submit_check,
             })?;
+        }
+        Commands::AuditReport { repo, output } => {
+            audit_report::cmd_audit_report(repo, output)?;
+        }
+        Commands::Chronovisor { target, finding_id } => {
+            cmd_chronovisor(target, finding_id)?;
         }
         Commands::DeployLabyrinth {
             output_dir,
@@ -3665,29 +3816,52 @@ fn enforce_pqc_key_age(
 /// from the git pack index via `shadow_git::simulate_merge`, no diff file needed.
 ///
 /// Loads the symbol registry from `registry_override` or `.janitor/symbols.rkyv`.
-#[allow(clippy::too_many_arguments)]
-fn cmd_bounce(
-    project_root: &Path,
-    patch_file: Option<&Path>,
-    registry_override: Option<&Path>,
-    format: &str,
-    repo: Option<&Path>,
-    base: Option<&str>,
-    head: Option<&str>,
+struct BounceConfig<'a> {
+    project_root: &'a Path,
+    patch_file: Option<&'a Path>,
+    registry_override: Option<&'a Path>,
+    format: &'a str,
+    repo: Option<&'a Path>,
+    base: Option<&'a str>,
+    head: Option<&'a str>,
     pr_number: Option<u64>,
-    author: Option<&str>,
-    pr_body: Option<&str>,
-    repo_slug: Option<&str>,
-    pr_state_str: &str,
-    governor_url: Option<&str>,
-    analysis_token: Option<&str>,
-    head_sha: Option<&str>,
+    author: Option<&'a str>,
+    pr_body: Option<&'a str>,
+    repo_slug: Option<&'a str>,
+    pr_state_str: &'a str,
+    governor_url: Option<&'a str>,
+    analysis_token: Option<&'a str>,
+    head_sha: Option<&'a str>,
     soft_fail_flag: bool,
     deep_scan_flag: bool,
-    pqc_key: Option<&str>,
-    wasm_rules_flag: &[String],
-    execution_tier: &str,
-) -> anyhow::Result<()> {
+    pqc_key: Option<&'a str>,
+    wasm_rules_flag: &'a [String],
+    execution_tier: &'a str,
+}
+
+fn cmd_bounce(cfg: BounceConfig<'_>) -> anyhow::Result<()> {
+    let BounceConfig {
+        project_root,
+        patch_file,
+        registry_override,
+        format,
+        repo,
+        base,
+        head,
+        pr_number,
+        author,
+        pr_body,
+        repo_slug,
+        pr_state_str,
+        governor_url,
+        analysis_token,
+        head_sha,
+        soft_fail_flag,
+        deep_scan_flag,
+        pqc_key,
+        wasm_rules_flag,
+        execution_tier,
+    } = cfg;
     use common::policy::JanitorPolicy;
     use common::registry::{MappedRegistry, SymbolRegistry};
     use forge::slop_filter::{bounce_git, PRBouncer, PatchBouncer};
@@ -3816,6 +3990,7 @@ fn cmd_bounce(
                 policy.suppressions.clone().unwrap_or_default(),
                 deep_scan,
                 &mut scan_state,
+                policy.forge.clone_exempt_paths.clone(),
             )?;
             // Fetch base Cargo.lock for silo delta (subtract pre-existing splits).
             let base_lock = fetch_base_lockfile_from_odb(repo_path, base_sha);
@@ -3910,14 +4085,52 @@ fn cmd_bounce(
                     }
                 }
             };
-            let mut score = PatchBouncer::for_workspace_with_deep_scan_and_suppressions(
+            // Resolve branch name for release-PR exemption in the blast-radius gate.
+            // Best source: `gh pr view` when a PR number + repo slug are available.
+            // Fallback: `git rev-parse --abbrev-ref HEAD` from the project root.
+            let resolved_branch: Option<String> = resolved_pr_number
+                .zip(resolved_repo_slug.as_ref())
+                .and_then(|(pn, slug)| {
+                    std::process::Command::new("gh")
+                        .args([
+                            "pr",
+                            "view",
+                            &pn.to_string(),
+                            "--repo",
+                            slug,
+                            "--json",
+                            "headRefName",
+                            "-q",
+                            ".headRefName",
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| {
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(project_root)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty() && s != "HEAD")
+                });
+            let mut bouncer = PatchBouncer::for_workspace_with_deep_scan_and_suppressions(
                 project_root,
                 policy.suppressions.clone().unwrap_or_default(),
                 deep_scan,
                 policy.execution_tier.clone(),
             )
             .with_require_pinned_dependencies(policy.forge.require_pinned_dependencies)
-            .bounce(&patch, &registry)?;
+            .with_clone_exempt_paths(policy.forge.clone_exempt_paths.clone());
+            if let Some(branch) = resolved_branch {
+                bouncer = bouncer.with_branch_name(branch);
+            }
+            let mut score = bouncer.bounce(&patch, &registry)?;
             let merkle_root = blake3::hash(patch.as_bytes()).to_hex().to_string();
             let sig = forge::pr_collider::PrDeltaSignature::from_bytes(patch.as_bytes());
 
@@ -5474,36 +5687,7 @@ fn cmd_update_wisdom_with_urls(
     println!("\u{1f9e0} Wisdom Registry synchronized with Janitor Sentinel.");
 
     if ci_mode {
-        // 3-attempt exponential backoff: 1 s → 2 s → 4 s.
-        // A single transient CISA endpoint failure must not silently produce
-        // an empty KEV manifest and tank the weekly sync.
-        const MAX_KEV_BYTES: u64 = 32 * 1024 * 1024;
-        let mut kev_bytes_opt: Option<Vec<u8>> = None;
-        for attempt in 0u32..3 {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1)));
-            }
-            let mut resp = match ureq::get(kev_url).call() {
-                Ok(r) => r,
-                Err(_e) => continue, // CodeQL: URL redacted — may carry credentials.
-            };
-            match resp
-                .body_mut()
-                .with_config()
-                .limit(MAX_KEV_BYTES)
-                .read_to_vec()
-            {
-                Ok(bytes) => {
-                    kev_bytes_opt = Some(bytes);
-                    break;
-                }
-                Err(_e) => continue,
-            }
-        }
-        let kev_bytes = kev_bytes_opt.ok_or_else(|| {
-            anyhow::anyhow!("update-wisdom --ci-mode: CISA KEV fetch failed after 3 attempts")
-        })?;
-
+        let kev_bytes = fetch_kev_with_retry(kev_url, "update-wisdom --ci-mode")?;
         let entries = parse_kev_json_entries(&kev_bytes)?;
 
         let manifest = serde_json::json!({
@@ -5534,6 +5718,133 @@ fn cmd_update_wisdom_with_urls(
     }
 
     Ok(())
+}
+
+/// Fetch ONLY the CISA KEV catalog and write `.janitor/wisdom_manifest.json`.
+///
+/// This codepath exists so the weekly KEV diff workflow can continue to operate
+/// even when the wisdom.rkyv binary mirror is undeployed or unreachable.  The
+/// JSON manifest is the only artifact the workflow's PR consumes; coupling its
+/// production to a separate (and possibly unavailable) signed binary mirror was
+/// the root cause of the 2026-Q2 weekly-sync outage.  The full strict
+/// `--ci-mode` path is still the right tool for full intelligence sync.
+fn cmd_update_wisdom_kev_manifest_only(project_root: &Path) -> anyhow::Result<()> {
+    const DEFAULT_CISA_KEV_URL: &str =
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+    let kev_url = env::var("JANITOR_CISA_KEV_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CISA_KEV_URL.to_string());
+    cmd_update_wisdom_kev_manifest_only_with_url(project_root, &kev_url)
+}
+
+fn cmd_update_wisdom_kev_manifest_only_with_url(
+    project_root: &Path,
+    kev_url: &str,
+) -> anyhow::Result<()> {
+    let janitor_dir = project_root.join(".janitor");
+    std::fs::create_dir_all(&janitor_dir)
+        .with_context(|| format!("creating {}", janitor_dir.display()))?;
+
+    let kev_bytes = fetch_kev_with_retry(kev_url, "update-wisdom --kev-manifest-only")?;
+    let entries = parse_kev_json_entries(&kev_bytes)?;
+
+    let manifest = serde_json::json!({
+        "source":       "CISA Known Exploited Vulnerabilities Catalog",
+        "generated_at": utc_now_iso8601(),
+        "entry_count":  entries.len(),
+        "entries":      entries,
+    });
+
+    write_wisdom_manifest(&janitor_dir, &manifest)?;
+
+    println!(
+        "\u{1f4cb} KEV manifest written: {} entries \u{2192} {}",
+        manifest["entry_count"],
+        janitor_dir.join("wisdom_manifest.json").display()
+    );
+
+    Ok(())
+}
+
+/// Classify a `ureq::Error` into a static-string label suitable for diagnostic
+/// logs without leaking URL fragments or credentials.  CodeQL's
+/// cleartext-logging-sensitive-data rule treats `ureq::Error::Display` output
+/// as a taint sink because it embeds the request URL — using only this static
+/// classifier in user-facing logs severs that sink while preserving enough
+/// signal to distinguish network from auth from server-side faults.
+fn classify_ureq_error(e: &ureq::Error) -> &'static str {
+    match e {
+        ureq::Error::StatusCode(c) => {
+            if (400..500).contains(c) {
+                "http_client_error_4xx"
+            } else if (500..600).contains(c) {
+                "http_server_error_5xx"
+            } else {
+                "http_other_status"
+            }
+        }
+        _ => "network_or_unknown",
+    }
+}
+
+/// Fetch the raw CISA KEV catalog JSON bytes with 3-attempt exponential backoff.
+///
+/// 4xx responses are treated as permanent and short-circuit the retry loop —
+/// no useful retry can recover from a 401/403/404 against a static asset.
+/// All other failures (connection refused, timeout, 5xx, body-read truncation)
+/// are retried with 1s → 2s → 4s backoff.
+fn fetch_kev_with_retry(kev_url: &str, mode_label: &str) -> anyhow::Result<Vec<u8>> {
+    const MAX_KEV_BYTES: u64 = 32 * 1024 * 1024;
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_class: &'static str = "no_attempt_completed";
+    for attempt in 0u32..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1)));
+        }
+        let mut resp = match ureq::get(kev_url).call() {
+            Ok(r) => r,
+            Err(e) => {
+                last_class = classify_ureq_error(&e);
+                eprintln!(
+                    "[kev-fetch] attempt {}/{MAX_ATTEMPTS} failed (class={last_class})",
+                    attempt + 1
+                );
+                if last_class == "http_client_error_4xx" {
+                    break;
+                }
+                continue;
+            }
+        };
+        match resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_KEV_BYTES)
+            .read_to_vec()
+        {
+            Ok(bytes) => {
+                if attempt > 0 {
+                    eprintln!(
+                        "[kev-fetch] succeeded on attempt {}/{MAX_ATTEMPTS}",
+                        attempt + 1
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(_e) => {
+                last_class = "body_read_failed";
+                eprintln!(
+                    "[kev-fetch] attempt {}/{MAX_ATTEMPTS} body-read failed",
+                    attempt + 1
+                );
+                continue;
+            }
+        }
+    }
+    eprintln!("[kev-fetch] all attempts failed (last_class={last_class})");
+    anyhow::bail!(
+        "{mode_label}: CISA KEV fetch failed after {MAX_ATTEMPTS} attempts (class={last_class})"
+    )
 }
 
 const OSV_DUMP_BASE_URL: &str = "https://osv-vulnerabilities.storage.googleapis.com";
@@ -6012,46 +6323,129 @@ fn select_wisdom_quorum_candidate(
     ))
 }
 
+/// 3-attempt exponential-backoff wrapper around [`fetch_verified_wisdom_payload_once`].
+///
+/// 4xx responses short-circuit (a 401/403/404 against a signed-mirror endpoint
+/// is permanent — no useful retry recovers from it).  All other failures
+/// (timeout, connection-reset, 5xx, body-read truncation) are retried with
+/// 1 s → 2 s → 4 s backoff.  Classification labels are static strings; the
+/// underlying URL and error details are never logged (CodeQL: mirror URL may
+/// carry rotation credentials in its query string).
 fn fetch_verified_wisdom_payload(
     wisdom_url: &str,
     wisdom_sig_url: &str,
     mode_label: &str,
 ) -> anyhow::Result<VerifiedWisdomPayload> {
-    let mut response = ureq::get(wisdom_url)
-        .call()
-        // CodeQL: URL and error details redacted — mirror URL may contain credentials.
-        .map_err(|_e| anyhow::anyhow!("{mode_label}: wisdom archive fetch failed"))?;
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_class: &'static str = "no_attempt_completed";
+    for attempt in 0u32..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1)));
+        }
+        match fetch_verified_wisdom_payload_once(wisdom_url, wisdom_sig_url, mode_label) {
+            Ok(p) => {
+                if attempt > 0 {
+                    eprintln!(
+                        "[wisdom-fetch] succeeded on attempt {}/{MAX_ATTEMPTS}",
+                        attempt + 1
+                    );
+                }
+                return Ok(p);
+            }
+            Err((class, _e)) => {
+                last_class = class;
+                eprintln!(
+                    "[wisdom-fetch] attempt {}/{MAX_ATTEMPTS} failed (class={last_class})",
+                    attempt + 1
+                );
+                if class == "http_client_error_4xx" {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("[wisdom-fetch] all attempts failed (last_class={last_class})");
+    anyhow::bail!("{mode_label}: wisdom archive fetch failed (class={last_class})")
+}
+
+/// Single-shot wisdom fetch.  Returns Err with a static classification label
+/// alongside the original error (the original is intentionally discarded by
+/// the retry wrapper to avoid logging mirror URLs or rotation credentials).
+fn fetch_verified_wisdom_payload_once(
+    wisdom_url: &str,
+    wisdom_sig_url: &str,
+    mode_label: &str,
+) -> Result<VerifiedWisdomPayload, (&'static str, anyhow::Error)> {
+    let mut response = match ureq::get(wisdom_url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            let class = classify_ureq_error(&e);
+            return Err((
+                class,
+                anyhow::anyhow!("{mode_label}: wisdom archive fetch failed (class={class})"),
+            ));
+        }
+    };
     // Circuit breaker: wisdom archives are typically a few hundred KiB.
     // 64 MiB provides a generous safety margin against unbounded heap growth.
     const MAX_WISDOM_BYTES: u64 = 64 * 1024 * 1024;
-    let bytes = response
+    let bytes = match response
         .body_mut()
         .with_config()
         .limit(MAX_WISDOM_BYTES)
         .read_to_vec()
-        // CodeQL: error details redacted.
-        .map_err(|_e| anyhow::anyhow!("update-wisdom: reading wisdom response body failed"))?;
+    {
+        Ok(b) => b,
+        Err(_e) => {
+            return Err((
+                "body_read_failed",
+                anyhow::anyhow!("update-wisdom: reading wisdom response body failed"),
+            ))
+        }
+    };
 
-    let mut sig_response = ureq::get(wisdom_sig_url)
-        .call()
-        // CodeQL: URL and error details redacted — mirror URL may contain credentials.
-        .map_err(|_e| anyhow::anyhow!("{mode_label}: wisdom signature fetch failed"))?;
+    let mut sig_response = match ureq::get(wisdom_sig_url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            let class = classify_ureq_error(&e);
+            return Err((
+                class,
+                anyhow::anyhow!("{mode_label}: wisdom signature fetch failed (class={class})"),
+            ));
+        }
+    };
     // Circuit breaker: Ed25519 signatures are exactly 64 bytes; 4 KiB is generous.
     const MAX_SIG_BYTES: u64 = 4 * 1024;
-    let sig_bytes = sig_response
+    let sig_bytes = match sig_response
         .body_mut()
         .with_config()
         .limit(MAX_SIG_BYTES)
         .read_to_vec()
-        // CodeQL: error details redacted.
-        .map_err(|_e| {
-            anyhow::anyhow!("update-wisdom: reading wisdom signature response body failed")
-        })?;
+    {
+        Ok(b) => b,
+        Err(_e) => {
+            return Err((
+                "sig_body_read_failed",
+                anyhow::anyhow!("update-wisdom: reading wisdom signature response body failed"),
+            ))
+        }
+    };
 
-    verify_wisdom_signature(&bytes, &sig_bytes)
-        .context("update-wisdom: detached wisdom signature verification failed")?;
-    let signature = common::wisdom::normalize_signature_string(&sig_bytes)
-        .ok_or_else(|| anyhow::anyhow!("update-wisdom: detached signature was empty"))?;
+    if let Err(e) = verify_wisdom_signature(&bytes, &sig_bytes) {
+        return Err((
+            "signature_invalid",
+            e.context("update-wisdom: detached wisdom signature verification failed"),
+        ));
+    }
+    let signature = match common::wisdom::normalize_signature_string(&sig_bytes) {
+        Some(s) => s,
+        None => {
+            return Err((
+                "signature_empty",
+                anyhow::anyhow!("update-wisdom: detached signature was empty"),
+            ))
+        }
+    };
     let hash = blake3::hash(&bytes).to_hex().to_string();
     Ok(VerifiedWisdomPayload {
         bytes,
@@ -6706,7 +7100,7 @@ mod replay_receipt_tests {
 
 #[cfg(test)]
 mod governor_routing_tests {
-    use super::cmd_bounce;
+    use super::{cmd_bounce, BounceConfig};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -6782,28 +7176,28 @@ mod governor_routing_tests {
         .expect("write patch");
 
         let governor_url = format!("http://{addr}");
-        let result = cmd_bounce(
-            &temp_root,
-            Some(&patch_path),
-            None,
-            "json",
-            None,
-            None,
-            None,
-            Some(42),
-            Some("operator"),
-            None,
-            Some("acme/repo"),
-            "open",
-            Some(&governor_url),
-            Some("stub-token"),
-            Some("deadbeef"),
-            false,
-            false,
-            None,
-            &[],
-            "Community",
-        );
+        let result = cmd_bounce(BounceConfig {
+            project_root: &temp_root,
+            patch_file: Some(&patch_path),
+            registry_override: None,
+            format: "json",
+            repo: None,
+            base: None,
+            head: None,
+            pr_number: Some(42),
+            author: Some("operator"),
+            pr_body: None,
+            repo_slug: Some("acme/repo"),
+            pr_state_str: "open",
+            governor_url: Some(&governor_url),
+            analysis_token: Some("stub-token"),
+            head_sha: Some("deadbeef"),
+            soft_fail_flag: false,
+            deep_scan_flag: false,
+            pqc_key: None,
+            wasm_rules_flag: &[],
+            execution_tier: "Community",
+        });
         assert!(result.is_ok(), "cmd_bounce should POST to custom governor");
 
         let (request_line, authorization, body) = rx
@@ -6830,9 +7224,128 @@ mod governor_routing_tests {
 #[cfg(test)]
 mod wisdom_sync_tests {
     use super::{
+        classify_ureq_error, cmd_update_wisdom_kev_manifest_only_with_url,
         cmd_update_wisdom_with_urls, select_wisdom_quorum_candidate, VerifiedWisdomPayload,
     };
     use std::fs;
+
+    #[test]
+    fn classify_ureq_error_distinguishes_status_classes() {
+        assert_eq!(
+            classify_ureq_error(&ureq::Error::StatusCode(404)),
+            "http_client_error_4xx",
+            "404 must classify as 4xx"
+        );
+        assert_eq!(
+            classify_ureq_error(&ureq::Error::StatusCode(401)),
+            "http_client_error_4xx",
+            "401 must classify as 4xx"
+        );
+        assert_eq!(
+            classify_ureq_error(&ureq::Error::StatusCode(503)),
+            "http_server_error_5xx",
+            "503 must classify as 5xx"
+        );
+        assert_eq!(
+            classify_ureq_error(&ureq::Error::StatusCode(302)),
+            "http_other_status",
+            "non-error status must classify as other"
+        );
+    }
+
+    #[test]
+    fn kev_manifest_only_fails_with_classification_when_kev_unreachable() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "janitor-kev-manifest-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root must be created");
+
+        let error = cmd_update_wisdom_kev_manifest_only_with_url(
+            &temp_root,
+            "http://127.0.0.1:9/known_exploited_vulnerabilities.json",
+        )
+        .expect_err("manifest-only must fail when KEV endpoint is unreachable");
+        let msg = error.to_string();
+        assert!(
+            msg.contains("CISA KEV fetch failed"),
+            "error must identify the failure point"
+        );
+        assert!(
+            msg.contains("class="),
+            "error must carry a static classification label"
+        );
+        assert!(
+            !temp_root.join(".janitor").join("wisdom.rkyv").exists(),
+            "manifest-only failure must never fabricate a wisdom.rkyv archive"
+        );
+        assert!(
+            !temp_root
+                .join(".janitor")
+                .join("wisdom_manifest.json")
+                .exists(),
+            "manifest-only failure must not write a partial manifest"
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn kev_manifest_only_writes_manifest_on_success() {
+        // Spin up a local HTTP server that returns a minimal CISA KEV JSON body
+        // and verify the manifest-only path writes the expected JSON manifest
+        // without ever touching wisdom.rkyv.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener must bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = br#"{"vulnerabilities":[{"cveID":"CVE-2026-0001","vendorProject":"vendor","product":"prod","vulnerabilityName":"name","dateAdded":"2026-01-01"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "janitor-kev-manifest-only-ok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root must be created");
+
+        let url = format!("http://127.0.0.1:{port}/kev.json");
+        cmd_update_wisdom_kev_manifest_only_with_url(&temp_root, &url)
+            .expect("manifest-only must succeed against a working KEV endpoint");
+
+        let manifest_path = temp_root.join(".janitor").join("wisdom_manifest.json");
+        assert!(
+            manifest_path.exists(),
+            "manifest-only success must write wisdom_manifest.json"
+        );
+        assert!(
+            !temp_root.join(".janitor").join("wisdom.rkyv").exists(),
+            "manifest-only must NEVER write wisdom.rkyv (decoupling invariant)"
+        );
+
+        let body = fs::read_to_string(&manifest_path).expect("manifest readable");
+        assert!(
+            body.contains("CVE-2026-0001"),
+            "manifest must contain the served CVE id"
+        );
+        assert!(
+            body.contains("CISA Known Exploited Vulnerabilities Catalog"),
+            "manifest must record the canonical source label"
+        );
+
+        let _ = server_thread.join();
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 
     #[test]
     fn ci_mode_fails_closed_when_wisdom_fetch_fails() {

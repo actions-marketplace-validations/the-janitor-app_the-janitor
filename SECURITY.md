@@ -7,6 +7,10 @@ Report vulnerabilities to [security@thejanitor.app](mailto:security@thejanitor.a
 Include the affected version, reproduction steps, impact, and any supporting
 artifacts needed to validate the issue deterministically.
 
+For the public trust boundary, workflow-permission rationale, website deployment
+path, and security posture statement, see [docs/security.md](docs/security.md)
+or the live page at [thejanitor.app/security/](https://thejanitor.app/security/).
+
 ## Supported Versions
 
 We support the current major version of The Janitor with security fixes and

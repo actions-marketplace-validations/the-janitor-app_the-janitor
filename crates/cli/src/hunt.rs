@@ -25,10 +25,11 @@
 //! `jq` dependency required).
 
 use anyhow::Context as _;
-use common::slop::StructuredFinding;
+use common::slop::{ExploitWitness, ProofClass, StructuredFinding, WebProofArtifact};
 use common::wisdom::{ArchivedSlopsquatCorpus, SlopsquatCorpus};
 use forge::brain::FindingRanker;
 use forge::slop_hunter::{find_slop, ParsedUnit};
+use forge::submission_assurance::score_acceptance_proof;
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,12 @@ pub struct HuntArgs<'a> {
     /// Bugcrowd report to the Bugcrowd Submissions API.  Only active with
     /// `format == "bugcrowd"`.
     pub submit: bool,
+    /// When `true`, cross-reference every finding against the program's
+    /// `tools/campaign/targets/<program>_targets.md` scope rules, emit
+    /// `[SCOPE: IN]` / `[SCOPE: OUT]` labels, and write `SUBMISSION_<id>.md`
+    /// into `.janitor/hunt_reports/` for every in-scope finding that survives
+    /// the artifact-emission threat-model gate.
+    pub submit_check: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,12 +112,13 @@ pub fn cmd_hunt(args: HuntArgs<'_>) -> anyhow::Result<()> {
         live_tenant_domain,
         live_tenant_client_id,
         submit,
+        submit_check,
     } = args;
 
     match format {
-        "json" | "bugcrowd" | "auth0" | "sarif" => {}
+        "json" | "bugcrowd" | "auth0" | "sarif" | "immunefi" => {}
         _ => anyhow::bail!(
-            "unsupported hunt output format '{format}' (expected 'json', 'bugcrowd', 'auth0', or 'sarif')"
+            "unsupported hunt output format '{format}' (expected 'json', 'bugcrowd', 'auth0', 'sarif', or 'immunefi')"
         ),
     }
 
@@ -203,7 +211,7 @@ pub fn cmd_hunt(args: HuntArgs<'_>) -> anyhow::Result<()> {
         if let Some(tenant_url) = live_tenant.filter(|value| is_live_tenant_replay_origin(value)) {
             findings = apply_live_tenant_replay(findings, tenant_url);
         }
-        let output_dir = std::env::current_dir().context("resolve current output directory")?;
+        let output_dir = hunt_reports_dir()?;
         emit_browser_dom_harnesses(&mut findings, &output_dir)?;
         findings
     };
@@ -214,6 +222,10 @@ pub fn cmd_hunt(args: HuntArgs<'_>) -> anyhow::Result<()> {
         .as_deref()
         .or(local_scan_component_info.as_deref());
     let findings = FindingRanker::rank_findings(findings, component_info_context);
+
+    if submit_check {
+        run_submit_check(&findings, local_scan_root)?;
+    }
 
     if format == "bugcrowd" {
         let report = if let Some(component_info) = component_info_context {
@@ -231,7 +243,7 @@ pub fn cmd_hunt(args: HuntArgs<'_>) -> anyhow::Result<()> {
             let submission = common::receipt::BountySubmission {
                 title: format!("{top_rule} findings in {target_label}"),
                 target: target_label.to_string(),
-                markdown_body: report.clone(),
+                markdown_body: report,
                 custom_field_vrt: findings
                     .first()
                     .map(|f| vrt_category(&f.id))
@@ -264,6 +276,12 @@ pub fn cmd_hunt(args: HuntArgs<'_>) -> anyhow::Result<()> {
             },
         );
         println!("{sarif}");
+        return Ok(());
+    }
+
+    if format == "immunefi" {
+        let report = format_immunefi_report(&findings, component_info_context);
+        println!("{report}");
         return Ok(());
     }
 
@@ -393,6 +411,7 @@ fn format_bugcrowd_report_with_component(
         let proof_of_concept = proof_of_concept_section(&sorted_group);
         let live_section = live_tenant_section(&sorted_group);
         let data_flow = path_proof_mermaid_section(&sorted_group);
+        let candidate_gap = candidate_ledger_gap_section(&sorted_group);
 
         reports.push(format!(
             "**Summary Title:** Multiple instances of {rule_id} in target\n\
@@ -405,6 +424,7 @@ I found the following vulnerable code paths while reviewing the target artifacts
 **Business Impact:** {business_impact}\n\
 **Data Flow Analysis:**\n\
 {upstream_validation_audit}\n\
+{candidate_gap}\
 **Vulnerability Reproduction:**\n\
 {proof_of_concept}\n\
 {live_section}\
@@ -430,6 +450,267 @@ No reproduction steps are required.\n\
     }
 
     reports.join("\n\n---\n\n")
+}
+
+fn candidate_ledger_gap_section(findings: &[&StructuredFinding]) -> String {
+    let gaps = findings
+        .iter()
+        .map(|finding| {
+            let oracle = score_acceptance_proof(finding);
+            let web_artifact = finding
+                .web_proof_artifact
+                .as_ref()
+                .map(|artifact| artifact.to_markdown())
+                .unwrap_or_default();
+            if oracle.is_empty() {
+                if web_artifact.is_empty() {
+                    "Acceptance Oracle: proof-complete.".to_string()
+                } else {
+                    web_artifact
+                }
+            } else if web_artifact.is_empty() {
+                format!("Acceptance Oracle: {}", oracle.ledger_gap_summary())
+            } else {
+                format!(
+                    "{web_artifact} Acceptance Oracle: {}",
+                    oracle.ledger_gap_summary()
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("**Candidate Ledger Gap:** {gaps}\n")
+}
+
+/// Render an Immunefi-format vulnerability submission for a finding set.
+///
+/// Maps Janitor finding IDs to the Immunefi Vulnerability Classification
+/// System (VCS) tier, emitting the standard Immunefi submission template
+/// (Title, Severity, Description, Proof of Concept, Recommended Fix, Impact)
+/// for each finding group.
+fn format_immunefi_report(findings: &[StructuredFinding], component_info: Option<&str>) -> String {
+    let target = component_info.unwrap_or("smart-contract target");
+    let grouped = group_ranked_findings(FindingRanker::rank_finding_refs(findings, component_info));
+
+    if grouped.is_empty() {
+        return format!(
+            "# Immunefi Audit Report — {target}\n\n\
+**Result:** No security findings identified.\n\n\
+*Generated by The Janitor {} — automated security engine*",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    let mut sections = Vec::with_capacity(grouped.len());
+    for (rule_id, group) in &grouped {
+        let (vcs_tier, payout_range) = immunefi_vcs_map(rule_id);
+        let severity = group
+            .iter()
+            .filter_map(|f| f.severity.as_deref())
+            .max_by_key(|s| severity_rank(s))
+            .unwrap_or("Informational");
+        let poc = group
+            .iter()
+            .filter_map(|f| f.exploit_witness.as_ref())
+            .filter_map(|w| w.repro_cmd.as_deref())
+            .find(|cmd| !cmd.trim().is_empty())
+            .map(|cmd| format!("```\n{cmd}\n```"))
+            .unwrap_or_else(|| {
+                "No automated PoC synthesized. Static analysis confirmed the vulnerable path. \
+Manual testing required to confirm runtime exploitability."
+                    .to_string()
+            });
+        let remediation = group
+            .iter()
+            .find_map(|f| f.remediation.as_deref())
+            .unwrap_or("Apply the recommended security pattern for this vulnerability class.");
+        let impact = immunefi_impact(rule_id, severity);
+        let locations: Vec<String> = group
+            .iter()
+            .filter_map(|f| {
+                f.file.as_deref().map(|file| {
+                    f.line
+                        .map(|l| format!("- `{file}:{l}`"))
+                        .unwrap_or_else(|| format!("- `{file}`"))
+                })
+            })
+            .collect();
+        let location_block = if locations.is_empty() {
+            "Location not available (binary/bytecode scan).".to_string()
+        } else {
+            locations.join("\n")
+        };
+
+        sections.push(format!(
+            "## {rule_id}\n\n\
+**Immunefi VCS Tier:** {vcs_tier}\n\
+**Severity:** {severity}\n\
+**Estimated Payout:** {payout_range}\n\n\
+### Description\n\
+A `{rule_id}` vulnerability was identified in `{target}`.\n\n\
+**Affected Locations:**\n{location_block}\n\n\
+### Proof of Concept\n{poc}\n\n\
+### Recommended Fix\n{remediation}\n\n\
+### Impact\n{impact}"
+        ));
+    }
+
+    format!(
+        "# Immunefi Audit Report — {target}\n\n\
+*Generated by The Janitor {} — automated security engine*\n\n\
+---\n\n{}\n\n---\n\n\
+**Submission Notes:** All findings above are generated by static analysis. \
+Each `security:reentrancy` and `security:unsafe_delegatecall` finding requires \
+manual confirmation of runtime exploitability before Immunefi submission. \
+Cross-reference against the program's scope rules before submitting.",
+        env!("CARGO_PKG_VERSION"),
+        sections.join("\n\n---\n\n")
+    )
+}
+
+/// Map a Janitor rule ID to the Immunefi VCS tier and payout range string.
+fn immunefi_vcs_map(rule_id: &str) -> (&'static str, &'static str) {
+    match rule_id {
+        id if id.contains("reentrancy") || id.contains("delegatecall") => (
+            "Critical — Direct theft of funds / permanent freezing",
+            "$50,000–$1,000,000+",
+        ),
+        id if id.contains("signature_replay") || id.contains("flash_loan") => (
+            "Critical — Theft of funds via cryptographic bypass",
+            "$50,000–$500,000",
+        ),
+        id if id.contains("oracle_price_manipulation") => (
+            "High — Price manipulation enabling indirect theft",
+            "$10,000–$50,000",
+        ),
+        id if id.contains("integer_overflow") || id.contains("arithmetic") => (
+            "High — Integer overflow enabling value manipulation",
+            "$10,000–$50,000",
+        ),
+        id if id.contains("authority_transition") => (
+            "High — Unprotected privilege escalation vector",
+            "$5,000–$40,000",
+        ),
+        _ => ("Medium — Smart contract security finding", "$1,000–$10,000"),
+    }
+}
+
+/// Map a rule ID + severity to an Immunefi-appropriate impact statement.
+fn immunefi_impact(rule_id: &str, severity: &str) -> &'static str {
+    if rule_id.contains("reentrancy") {
+        return "Complete drainage of contract ETH/token balance via recursive call. \
+Attacker can re-enter the vulnerable function before the state update, \
+repeatedly withdrawing in a single transaction.";
+    }
+    if rule_id.contains("delegatecall") {
+        return "Arbitrary code execution in the context of the proxy contract. \
+An attacker-controlled delegatecall target can overwrite storage slots, \
+steal ownership, and drain all protocol funds.";
+    }
+    if rule_id.contains("signature_replay") {
+        return "Replay of previously-valid signatures across chain IDs or nonce \
+boundaries allows an attacker to re-execute authorized actions \
+(token transfers, governance votes) without re-obtaining a valid signature.";
+    }
+    if rule_id.contains("oracle_price_manipulation") {
+        return "Flash-loan price manipulation allows the attacker to move the spot price \
+to an extreme value within a single block, enabling profitable arbitrage at \
+the expense of the protocol's liquidity providers.";
+    }
+    if rule_id.contains("flash_loan") {
+        return "Unvalidated flash loan callback can be invoked by any caller, allowing \
+protocol funds to be stolen by bypassing the lending pool's repayment check.";
+    }
+    match severity {
+        "KevCritical" | "Critical" => {
+            "Protocol funds at direct risk of exfiltration or permanent freezing."
+        }
+        "High" => "Significant loss of funds or protocol integrity degradation.",
+        "Medium" => "Limited economic impact; requires chaining with additional vulnerabilities.",
+        _ => "Informational — no direct financial impact identified.",
+    }
+}
+
+/// Run scope verification and SUBMISSION.md generation if `submit_check` is enabled.
+fn run_submit_check(
+    findings: &[StructuredFinding],
+    scan_root: Option<&Path>,
+) -> anyhow::Result<()> {
+    use crate::audit_report::extract_git_remote;
+    use crate::submit_formatter::{
+        annotate_scope, print_scope_report, write_submissions, ScopeRules,
+    };
+
+    let program_name = scan_root
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown-program");
+    let canonical_target = scan_root
+        .map(extract_git_remote)
+        .unwrap_or_else(|| program_name.to_string());
+
+    let campaign_targets_dir = std::path::PathBuf::from("tools/campaign/targets");
+    let targets_path = campaign_targets_dir.join(format!("{program_name}_targets.md"));
+    let targets_path = if targets_path.exists() {
+        Some(targets_path)
+    } else {
+        find_targets_file_for_canonical_target(&campaign_targets_dir, &canonical_target)
+    };
+
+    let scope_rules = if let Some(targets_path) = targets_path.as_ref() {
+        ScopeRules::load(targets_path)?
+    } else {
+        eprintln!(
+            "[submit-check] no targets file found for {}; using permissive scope",
+            canonical_target
+        );
+        ScopeRules::load_permissive()
+    };
+
+    let annotated = annotate_scope(findings, &scope_rules);
+    print_scope_report(&annotated);
+
+    let output_dir = hunt_reports_dir()?;
+    let written = write_submissions(&annotated, &output_dir, &canonical_target)?;
+    if written > 0 {
+        eprintln!(
+            "[submit-check] {written} SUBMISSION.md file(s) written to {}",
+            output_dir.display()
+        );
+    } else {
+        eprintln!(
+            "[submit-check] no in-scope findings with repro_cmd — no SUBMISSION.md files generated"
+        );
+    }
+    Ok(())
+}
+
+fn find_targets_file_for_canonical_target(
+    campaign_targets_dir: &Path,
+    canonical_target: &str,
+) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(campaign_targets_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).ok()?;
+        if content.contains(canonical_target) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn hunt_reports_dir() -> anyhow::Result<PathBuf> {
+    let dir = std::env::current_dir()
+        .context("resolve current workspace directory")?
+        .join(".janitor")
+        .join("hunt_reports");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create hunt reports dir {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Render an Auth0-style Markdown vulnerability report for a finding set.
@@ -466,8 +747,7 @@ fn format_auth0_report_with_component(
     }
 
     let mut reports = Vec::with_capacity(grouped.len());
-    for (rule_id, group) in &grouped {
-        let mut sorted_group = group.clone();
+    for (rule_id, mut sorted_group) in grouped {
         sorted_group.sort_by(|left, right| {
             let left_key = (
                 left.file.as_deref().unwrap_or("~"),
@@ -691,6 +971,13 @@ fn proof_of_concept_section(findings: &[&StructuredFinding]) -> String {
     {
         return format!("```text\n{repro_cmd}\n```");
     }
+    if let Some(artifact) = findings
+        .iter()
+        .filter_map(|finding| finding.web_proof_artifact.as_ref())
+        .next()
+    {
+        return artifact.to_markdown();
+    }
     // Synthesize class-specific PoC stubs for taint-family findings when no
     // dynamic repro_cmd was generated by the Z3 engine.
     if findings
@@ -828,6 +1115,14 @@ The reproduction was prepared for an approved test tenant. Captured verification
 }
 
 fn path_proof_mermaid_section(findings: &[&StructuredFinding]) -> String {
+    if let Some(artifact) = findings
+        .iter()
+        .filter_map(|finding| finding.web_proof_artifact.as_ref())
+        .next()
+    {
+        return render_ifds_graph(&artifact.bound_ifds_trace());
+    }
+
     let Some(proof) = findings
         .iter()
         .filter_map(|f| f.exploit_witness.as_ref())
@@ -845,9 +1140,19 @@ fn path_proof_mermaid_section(findings: &[&StructuredFinding]) -> String {
     if nodes.len() < 2 {
         return String::new();
     }
+    render_ifds_graph(&nodes)
+}
+
+fn render_ifds_graph<T: AsRef<str>>(nodes: &[T]) -> String {
+    if nodes.len() < 2 {
+        return String::new();
+    }
     let mut graph = String::from("**Data Flow Graph:**\n```mermaid\nflowchart LR\n");
     for (idx, node) in nodes.iter().enumerate() {
-        graph.push_str(&format!("  n{idx}[\"{}\"]\n", escape_mermaid_label(node)));
+        graph.push_str(&format!(
+            "  n{idx}[\"{}\"]\n",
+            escape_mermaid_label(node.as_ref())
+        ));
     }
     for idx in 0..nodes.len() - 1 {
         graph.push_str(&format!("  n{idx} --> n{}\n", idx + 1));
@@ -893,6 +1198,9 @@ fn emit_browser_dom_harnesses(
 ) -> anyhow::Result<()> {
     let mut emitted = BTreeMap::<String, usize>::new();
     for finding in findings {
+        if !forge::exploitability::artifact_emission_allowed(finding, true) {
+            continue;
+        }
         let Some(witness) = finding.exploit_witness.as_mut() else {
             continue;
         };
@@ -980,6 +1288,45 @@ fn replace_host_in_curl(repro_cmd: &str, live_tenant: &str) -> String {
     repro_cmd.replacen(full_url, &new_url, 1)
 }
 
+fn bounded_curl_command(repro_cmd: &str) -> String {
+    let mut missing_opts = Vec::new();
+    if !repro_cmd.contains("--connect-timeout") {
+        missing_opts.push("--connect-timeout 5");
+    }
+    if !repro_cmd.contains("--max-time") {
+        missing_opts.push("--max-time 20");
+    }
+    if !repro_cmd.contains("--retry") {
+        missing_opts.push("--retry 0");
+    }
+    if missing_opts.is_empty() {
+        return repro_cmd.to_string();
+    }
+    repro_cmd.replacen("curl ", &format!("curl {} ", missing_opts.join(" ")), 1)
+}
+
+fn authorization_replay_verdict(live_proof: &str) -> String {
+    if live_proof.contains("HTTP/1.1 200")
+        || live_proof.contains("HTTP/2 200")
+        || live_proof.contains("HTTP/3 200")
+    {
+        return "potential_cross_tenant_read: replay returned 2xx".to_string();
+    }
+    if live_proof.contains("HTTP/1.1 401")
+        || live_proof.contains("HTTP/1.1 403")
+        || live_proof.contains("HTTP/1.1 404")
+        || live_proof.contains("HTTP/2 401")
+        || live_proof.contains("HTTP/2 403")
+        || live_proof.contains("HTTP/2 404")
+        || live_proof.contains("HTTP/3 401")
+        || live_proof.contains("HTTP/3 403")
+        || live_proof.contains("HTTP/3 404")
+    {
+        return "control_enforced: replay denied cross-principal object access".to_string();
+    }
+    "inconclusive: live replay did not expose an HTTP authorization status".to_string()
+}
+
 /// Execute `repro_cmd` against `live_tenant` for every finding that carries a
 /// synthesized curl command. Populates `ExploitWitness::live_proof` with the
 /// captured stdout+stderr of the shell invocation.
@@ -997,7 +1344,7 @@ fn apply_live_tenant_replay(
         if !repro_cmd.trim_start().starts_with("curl ") {
             continue;
         }
-        let cmd = replace_host_in_curl(repro_cmd, live_tenant);
+        let cmd = bounded_curl_command(&replace_host_in_curl(repro_cmd, live_tenant));
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -1022,6 +1369,14 @@ fn apply_live_tenant_replay(
             }
             Err(e) => Some(format!("live-tenant execution failed: {e}")),
         };
+        if finding.id == "security:missing_ownership_check" {
+            if let (Some(authz), Some(live_proof)) = (
+                witness.authorization_witness.as_mut(),
+                witness.live_proof.as_deref(),
+            ) {
+                authz.replay_verdict = authorization_replay_verdict(live_proof);
+            }
+        }
     }
     findings
 }
@@ -1956,7 +2311,7 @@ fn resolve_python_module_path(root: &Path, module: &str) -> Option<PathBuf> {
 fn scan_python_priority_file(path: &Path, label: &str) -> anyhow::Result<Vec<StructuredFinding>> {
     let source =
         std::fs::read(path).with_context(|| format!("read python file {}", path.display()))?;
-    Ok(scan_buffer("py", &source, label, &[], false))
+    Ok(scan_buffer("py", &source, label, &[], &[], false))
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,8 +2785,9 @@ fn is_placeholder_scan_root(scan_root: Option<&Path>, has_explicit_ingest_source
 /// Walk `dir` recursively, run all detectors on every file, and return the
 /// unified finding list.  Files > 1 MiB and unreadable files are silently
 /// skipped.
-fn scan_directory(dir: &Path) -> anyhow::Result<Vec<StructuredFinding>> {
+pub(crate) fn scan_directory(dir: &Path) -> anyhow::Result<Vec<StructuredFinding>> {
     let mut all: Vec<StructuredFinding> = Vec::new();
+    let mut controller_surfaces = Vec::new();
     let mut frontend_routes = Vec::new();
     let has_ai_assistant_config = has_ai_assistant_config(dir);
     let gadget_manifests = collect_gadget_manifest_blobs(dir);
@@ -2473,6 +2829,9 @@ fn scan_directory(dir: &Path) -> anyhow::Result<Vec<StructuredFinding>> {
             .to_string_lossy()
             .to_string();
         frontend_routes.extend(forge::authz::extract_frontend_routes_from_source(
+            ext, &source, &rel_path,
+        ));
+        controller_surfaces.extend(forge::authz::extract_controller_surface_matches_for_file(
             ext, &source, rel_path,
         ));
     }
@@ -2514,6 +2873,7 @@ fn scan_directory(dir: &Path) -> anyhow::Result<Vec<StructuredFinding>> {
             ext,
             &source,
             &rel_path,
+            &controller_surfaces,
             &frontend_routes,
             has_ai_assistant_config,
         ));
@@ -2525,7 +2885,618 @@ fn scan_directory(dir: &Path) -> anyhow::Result<Vec<StructuredFinding>> {
         ));
     }
 
-    Ok(dedup_findings(all))
+    let mut deduped = dedup_findings(all);
+    // P2-16: demote protobuf Any schema findings when no reachable decode call exists.
+    apply_protobuf_any_reachability_demotion(dir, &mut deduped);
+    // P2-16: demote protobuf Any findings whose file extension is .proto (schema-only).
+    apply_p2_16_protobuf_demotion(&mut deduped);
+    // P2-17: demote SSRF findings whose URL source is operator-config backed.
+    apply_config_backed_ssrf_demotion(&mut deduped);
+    // Sprint 140 — threat-model oracle. Suppress findings covered by per-route
+    // auth decorators, downgrade to Informational when blueprint-level auth
+    // hooks cover the route, suppress ownership-class findings on projects
+    // that declare a shared-access threat model. Runs BEFORE the deprecation
+    // and focus-area filters so suppressed findings skip downstream cycles.
+    apply_threat_model_oracle(dir, &mut deduped);
+    // Sprint 142 — JWT keyfunc oracle. Demote security:jwt_*_bypass findings
+    // when the surrounding keyfunc body contains an algorithm allowlist check
+    // or a type assertion on token.Method. Closes the chainlink JWT FP class
+    // (Sprint 141 Tier-1 disposition).
+    apply_jwt_keyfunc_demotion(dir, &mut deduped);
+    // Sprint 142 — concrete-typed Unmarshal demotion. Demote
+    // security:protobuf_any_unguarded_decode findings when the surrounding
+    // proto.Unmarshal call has no anypb.Any reference nearby — the cited
+    // Unmarshal is into a concrete typed message, not an Any field. Closes
+    // the chainlink protobuf_any FP class (Sprint 141 Tier-1 disposition).
+    apply_concrete_typed_unmarshal_demotion(dir, &mut deduped);
+    // Sprint 143 — SQL sanitizer oracle. Demote security:sql_injection
+    // / security:sqli* findings when the cited line is in a properly-
+    // sanitized SQL context (pq.QuoteIdentifier / prepared statement /
+    // //nolint:gosec annotation / test-fixture function). Closes the
+    // chainlink SQLi FP class (Sprint 141 Tier-1 disposition).
+    apply_sql_sanitizer_demotion(dir, &mut deduped);
+    // Sprint 163 — proof-obligation classifiers. Attach deterministic proof
+    // classes for detector families whose triage depends on nearby source
+    // context before the false-positive proof obligation gate runs.
+    apply_proof_classification(dir, &mut deduped);
+    // Sprint 138 — demote findings on deprecated / community-only targets.
+    apply_deprecation_demotion(dir, &mut deduped);
+    // Sprint 138 — annotate findings whose vulnerability class does not
+    // match the bounty program's stated focus areas (50% approval downgrade).
+    apply_focus_area_demotion(dir, &mut deduped);
+    Ok(forge::proof_obligation::enforce_false_positive_proof_obligation(&deduped))
+}
+
+/// Sprint 140 — Wire-in for `forge::threat_model_oracle::classify_finding`.
+///
+/// Iterates the candidate finding set, asks the oracle for a verdict on
+/// each, and applies the verdict to the finding stream:
+/// - `Suppress`: remove from results — the cited code is protected by a
+///   per-route auth decorator or the project declares a shared-access
+///   threat model that the upstream detector failed to account for.
+/// - `DowngradeInformational`: keep the finding but set `severity` to
+///   `Informational` and annotate `remediation` with the cause. The
+///   blueprint covers the route via a framework-level hook, but
+///   attribution is coarse enough that we surface it for operator review.
+/// - `Emit`: no-op — preserve the upstream detector verdict.
+///
+/// Motivating regression (Sprint 140 SecureDrop IDOR FP): the upstream
+/// ownership-check detector emitted a 44% approval CANDIDATE for
+/// `journalist_app/admin.py:354` despite the `@admin_required` decorator
+/// at line 355. This wire-in catches the class structurally.
+fn apply_threat_model_oracle(dir: &Path, findings: &mut Vec<StructuredFinding>) {
+    findings.retain_mut(|finding| {
+        match forge::threat_model_oracle::classify_finding(dir, finding) {
+            forge::threat_model_oracle::ThreatModelVerdict::Suppress => false,
+            forge::threat_model_oracle::ThreatModelVerdict::DowngradeInformational => {
+                finding.severity = Some("Informational".to_string());
+                let existing = finding.remediation.take().unwrap_or_default();
+                finding.remediation = Some(format!(
+                    "{existing} [threat_model_oracle: blueprint_auth_hook_covers_route — downgraded by Sprint 140 oracle]"
+                ));
+                true
+            }
+            forge::threat_model_oracle::ThreatModelVerdict::Emit => true,
+        }
+    });
+}
+
+/// Sprint 142 — Concrete-typed Unmarshal demotion.
+///
+/// The `security:protobuf_any_unguarded_decode` detector emits findings on
+/// every `proto.Unmarshal` call site without inspecting the destination
+/// type. The protobuf-Any vulnerability class requires an `anypb.Any`
+/// destination with `type_url` dispatch to arbitrary types — concrete
+/// typed messages cannot suffer the type-confusion attack.
+///
+/// Heuristic: scan ±10 lines of the cited line in the cited file. If
+/// no `anypb.Any` reference (`anypb.Any`, `*anypb.Any`, `anypb.New`,
+/// `anypb.UnmarshalNew`, `ptypes.UnmarshalAny`, or `Any.UnmarshalTo`)
+/// is present in that window, the Unmarshal target is concrete-typed
+/// and the finding is a false positive.
+///
+/// Motivating regression (Sprint 141 chainlink protobuf_any FP):
+/// `core/capabilities/confidentialrelay/handler.go:416` was
+/// `proto.Unmarshal(payloadBytes, &sdkReq)` where `sdkReq` is
+/// `sdkpb.CapabilityRequest` — a concrete typed protobuf message.
+/// The detector misidentified the threat model. This post-filter
+/// catches the class structurally.
+fn apply_concrete_typed_unmarshal_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    /// Scan window around the cited line for `anypb.Any` evidence.
+    /// 10 lines on each side covers the typical Go variable-declaration
+    /// distance from its `proto.Unmarshal` site.
+    const SCAN_RADIUS: usize = 10;
+    /// Substrings that indicate genuine `anypb.Any` usage near the
+    /// Unmarshal call. Any match in the scan window preserves the
+    /// upstream finding verdict.
+    const ANYPB_MARKERS: &[&str] = &[
+        "anypb.Any",
+        "*anypb.Any",
+        "anypb.New",
+        "anypb.UnmarshalNew",
+        "ptypes.UnmarshalAny",
+        "Any.UnmarshalTo",
+    ];
+
+    for finding in findings.iter_mut() {
+        if !finding.id.contains("protobuf_any_unguarded_decode") {
+            continue;
+        }
+        let Some(rel_path) = finding.file.as_deref() else {
+            continue;
+        };
+        let abs_path = dir.join(rel_path);
+        let Ok(content) = std::fs::read_to_string(&abs_path) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let Some(line_num) = finding.line else {
+            continue;
+        };
+        let target_idx = (line_num as usize).saturating_sub(1);
+        let start = target_idx.saturating_sub(SCAN_RADIUS);
+        let end = (target_idx + SCAN_RADIUS + 1).min(lines.len());
+        if start >= end {
+            continue;
+        }
+        let window = lines[start..end].join("\n");
+        let has_anypb = ANYPB_MARKERS.iter().any(|m| window.contains(m));
+        if !has_anypb {
+            finding.severity = Some("Informational".to_string());
+            let existing = finding.remediation.take().unwrap_or_default();
+            finding.remediation = Some(format!(
+                "{existing} [concrete_typed_unmarshal: cited Unmarshal target has no anypb.Any reference within {SCAN_RADIUS} lines — destination is a concrete typed message, not the Any type-confusion class]"
+            ));
+        }
+    }
+}
+
+/// Sprint 143 — Wire-in for `forge::sql_sanitizer_oracle::classify_sql_finding`.
+///
+/// For each finding whose `id` matches `forge::sql_sanitizer_oracle::is_sql_class`
+/// (SQL injection class), inspect the cited file for sanitizer context. If
+/// the oracle returns `Sanitized`, the finding is demoted to `Informational`
+/// severity with an annotation citing which sanitizer signal matched.
+///
+/// Motivating regression (Sprint 141 chainlink SQLi FP): the cited line
+/// at `core/store/store.go:156` was inside `dropAndCreatePristineDB`
+/// (test infrastructure) and used `pq.QuoteIdentifier()` (proper
+/// identifier escaping) with an inline `//nolint:gosec` annotation. The
+/// upstream detector emitted on the syntactic concatenation pattern
+/// without any of these context signals.
+fn apply_sql_sanitizer_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    for finding in findings.iter_mut() {
+        if !forge::sql_sanitizer_oracle::is_sql_class(finding) {
+            continue;
+        }
+        let Some(rel_path) = finding.file.as_deref() else {
+            continue;
+        };
+        let abs_path = dir.join(rel_path);
+        if forge::sql_sanitizer_oracle::classify_sql_finding(&abs_path, finding.line)
+            == forge::sql_sanitizer_oracle::SqlSanitizerVerdict::Sanitized
+        {
+            finding.severity = Some("Informational".to_string());
+            let existing = finding.remediation.take().unwrap_or_default();
+            finding.remediation = Some(format!(
+                "{existing} [sql_sanitizer_oracle: cited line is in a sanitized SQL context (quoting helper, //nolint annotation, or test-fixture function)]"
+            ));
+        }
+    }
+}
+
+/// Sprint 142 — Wire-in for `forge::jwt_keyfunc_oracle::classify_jwt_finding`.
+///
+/// For each finding whose `id` is a JWT-class vulnerability (per
+/// `forge::jwt_keyfunc_oracle::is_jwt_class`), inspect the surrounding
+/// keyfunc body in the cited source file. If the keyfunc contains an
+/// algorithm allowlist check or a type assertion on `token.Method`, the
+/// finding is demoted to `Informational` severity with an annotation
+/// citing the guard.
+///
+/// Sprint 147 — Phase 2B: Wire-in for the three new `forge::threat_model_oracle`
+/// suppression predicates.
+/// Attach proof classes to findings before the proof-obligation gate.
+///
+/// For `security:intent_divergence`: attaches `ReachabilityProof` when the
+/// source file contains a zero-auth provider indicator outside a test path;
+/// otherwise attaches `LatticeGapProposal`.
+///
+/// For `security:ffi_unsafe_deref` and `security:raw_pointer_deref`: attaches
+/// `InvariantViolationProof` (and drops the finding as a FP) when a null guard
+/// is visible within ±5 lines; attaches `ReachabilityProof` when `extern "C"`
+/// is visible; otherwise attaches `LatticeGapProposal`.
+///
+/// For `security:lcm_double_free`: attaches `InvariantViolationProof` (drops as FP)
+/// when a dominance-verified free guard is present; `ReachabilityProof` when an
+/// exported C symbol is visible; otherwise `LatticeGapProposal`.
+///
+/// For `security:non_constant_time_comparison`: attaches `ReachabilityProof`
+/// when the source contains HMAC/session-key markers outside a test path;
+/// otherwise `LatticeGapProposal`.
+fn classify_one_proof(dir: &Path, finding: &StructuredFinding) -> Option<ProofClass> {
+    use forge::proof_obligation as po;
+    let id = finding.id.as_str();
+    let src = || {
+        finding
+            .file
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(dir.join(p)).ok())
+            .unwrap_or_default()
+    };
+    let line = finding.line.unwrap_or(1) as usize;
+    Some(if id.contains("intent_divergence") {
+        po::classify_intent_divergence_proof(finding, &src())
+    } else if id.contains("ffi_unsafe_deref") || id.contains("raw_pointer_deref") {
+        po::classify_ffi_deref_proof(&src(), line)
+    } else if id.contains("lcm_double_free") {
+        po::classify_lcm_double_free_proof(&src(), line)
+    } else if id.contains("non_constant_time_comparison") {
+        po::classify_timing_comparison_proof(&src(), finding)
+    } else if id.contains("lcm_use_after_free") {
+        po::classify_lcm_use_after_free_proof(&src(), line)
+    } else if id.contains("lcm_malloc_integer_truncation") {
+        po::classify_lcm_malloc_integer_truncation_proof(&src(), finding)
+    } else if id.contains("lcm_off_by_one_loop") {
+        po::classify_lcm_off_by_one_loop_proof(&src(), finding)
+    } else if id.contains("oauth_missing_state_validation") {
+        po::classify_oauth_state_validation_proof(&src(), finding)
+    } else if id.contains("oauth_excessive_scope") {
+        po::classify_oauth_excessive_scope_proof(&src(), finding)
+    } else if id.contains("pqc_hybrid_downgrade") {
+        po::classify_pqc_hybrid_downgrade_proof(&src(), finding)
+    } else if id.contains("unverified_provenance") {
+        po::classify_unverified_provenance_proof(&src(), finding)
+    } else if id.contains("cargo_build_worm") {
+        po::classify_cargo_build_worm_proof(&src(), finding)
+    } else if id.contains("ci_persistence_vector") {
+        po::classify_ci_persistence_vector_proof(&src(), finding)
+    } else if id.contains("java_deser_allowlist_bypass") {
+        po::classify_java_deser_allowlist_bypass_proof(&src(), finding)
+    } else if id.contains("unsafe_deserialization") {
+        po::classify_unsafe_deserialization_proof(&src(), finding)
+    } else if id.contains("mcp_confused_deputy_dispatch") {
+        po::classify_mcp_confused_deputy_dispatch_proof(&src(), finding)
+    } else if id.contains("embedding_trust_transposition") {
+        po::classify_embedding_trust_transposition_proof(&src(), finding)
+    } else if id.contains("rag_context_poisoning") {
+        po::classify_rag_context_poisoning_proof(&src(), finding)
+    } else if id.contains("path_traversal_concatenation") {
+        po::classify_path_traversal_concat_proof(&src(), finding)
+    } else if id.contains("dynamic_import") {
+        po::classify_dynamic_import_proof(&src(), finding)
+    } else if id.contains("dangerous_execution") {
+        po::classify_dangerous_execution_proof(&src(), finding)
+    } else if id.contains("bounded_overflow_witness") {
+        po::classify_bounded_overflow_proof(&src(), finding)
+    } else if id.contains("ld_preload_injection") {
+        po::classify_ld_preload_injection_proof(&src(), finding)
+    } else if id.contains("ffi_memory_corruption") {
+        po::classify_ffi_memory_corruption_proof(&src(), finding)
+    } else if id.contains("xxe_saml_parser") {
+        po::classify_xxe_saml_parser_proof(&src(), finding)
+    } else if id.contains("saml_xsw_validation_order") {
+        po::classify_saml_xsw_validation_order_proof(&src(), finding)
+    } else if id.contains("jndi_injection") {
+        po::classify_jndi_injection_proof(&src(), finding)
+    } else if id.contains("eval_injection") {
+        po::classify_eval_injection_proof(&src(), finding)
+    } else if id.contains("process_builder_injection") {
+        po::classify_process_builder_injection_proof(&src(), finding)
+    } else if id.contains("oauth_account_fusion") {
+        po::classify_oauth_account_fusion_proof(&src(), finding)
+    } else if id.contains("protobuf_any_unguarded_decode") {
+        po::classify_protobuf_any_proof(&src(), finding)
+    } else if id.contains("sqli_concatenation") {
+        po::classify_sqli_concatenation_proof(&src(), finding)
+    } else if id.contains("financial_pii_to_external_llm") {
+        po::classify_financial_pii_proof(&src(), finding)
+    } else if id.contains("react_xss_dangerous_html") {
+        po::classify_react_xss_proof(&src(), finding)
+    } else if id.contains("unauthenticated_debug_endpoint") {
+        po::classify_debug_endpoint_proof(&src(), finding)
+    } else if id.contains("jwt_validation_bypass") {
+        po::classify_jwt_validation_bypass_proof(&src(), finding)
+    } else {
+        return None;
+    })
+}
+
+fn apply_proof_classification(dir: &Path, findings: &mut Vec<StructuredFinding>) {
+    findings.retain_mut(|finding| {
+        let Some(proof) = classify_one_proof(dir, finding) else {
+            return true;
+        };
+        if proof == ProofClass::InvariantViolationProof {
+            return false;
+        }
+        finding.proof_class = Some(proof);
+        true
+    });
+}
+/// Motivating regression (Sprint 141 chainlink JWT FP): the upstream
+/// detector emitted a 36% approval CANDIDATE for `core/utils/jwt.go:230`
+/// without inspecting the keyfunc body at lines 258-266, which contains
+/// TWO algorithm validation gates (`token.Method.Alg() != ...` and a
+/// type assertion on `*SigningMethodEth`).
+fn apply_jwt_keyfunc_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    for finding in findings.iter_mut() {
+        if !forge::jwt_keyfunc_oracle::is_jwt_class(finding) {
+            continue;
+        }
+        let Some(rel_path) = finding.file.as_deref() else {
+            continue;
+        };
+        let abs_path = dir.join(rel_path);
+        if forge::jwt_keyfunc_oracle::classify_jwt_finding(&abs_path, finding.line)
+            == forge::jwt_keyfunc_oracle::JwtKeyfuncVerdict::Guarded
+        {
+            finding.severity = Some("Informational".to_string());
+            let existing = finding.remediation.take().unwrap_or_default();
+            finding.remediation = Some(format!(
+                "{existing} [jwt_keyfunc_oracle: keyfunc_body_contains_algorithm_allowlist_or_type_assertion]"
+            ));
+        }
+    }
+}
+
+/// Sprint 138 — Wire-in for `forge::slop_filter::apply_focus_area_check`.
+///
+/// Detects the bounty program for `dir` (via directory name + git remote
+/// canonicalisation) and looks up its scope file in
+/// `tools/campaign/targets/<program>_targets.md`. If a scope file is found,
+/// the focus-area cross-check runs and annotates any finding whose
+/// vulnerability class does not textually overlap the program's stated
+/// `### Focus Areas` bullet list.
+fn apply_focus_area_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    use crate::audit_report::extract_git_remote;
+
+    if findings.is_empty() {
+        return;
+    }
+    let Some(program_name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let canonical_target = extract_git_remote(dir);
+    let campaign_targets_dir = std::path::PathBuf::from("tools/campaign/targets");
+    let direct_path = campaign_targets_dir.join(format!("{program_name}_targets.md"));
+    let scope_file = if direct_path.exists() {
+        Some(direct_path)
+    } else {
+        find_targets_file_for_canonical_target(&campaign_targets_dir, &canonical_target)
+    };
+    if let Some(scope_file) = scope_file {
+        forge::slop_filter::apply_focus_area_check(findings, &scope_file);
+    }
+}
+
+/// Sprint 138 — Target Deprecation Cross-Check.
+///
+/// Scans the target directory's README.md, README, README.rst, SECURITY.md,
+/// and CONTRIBUTING.md for deprecation-signal keywords. If any are found,
+/// the project is no longer officially maintained; findings against it are
+/// bounty-ineligible per most bug-bounty program scope exclusions (community
+/// plugins are accepted "informational only" per program rules).
+///
+/// Returns `Some((filename, matched_keyword))` on first hit, `None` otherwise.
+pub fn is_deprecated_target(dir: &Path) -> Option<(String, String)> {
+    const KEYWORDS: &[&str] = &[
+        "archived",
+        "deprecated",
+        "community-maintained",
+        "no longer officially supported",
+        "transitioned to community",
+        "no longer actively maintained",
+        "moved to maintenance mode",
+    ];
+    const CANDIDATE_FILES: &[&str] = &[
+        "README.md",
+        "README.rst",
+        "README",
+        "README.txt",
+        "SECURITY.md",
+        "CONTRIBUTING.md",
+    ];
+    const SCAN_WINDOW_BYTES: usize = 16 * 1024;
+
+    for filename in CANDIDATE_FILES {
+        let path = dir.join(filename);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let scan_window = content
+            .get(..content.len().min(SCAN_WINDOW_BYTES))
+            .unwrap_or(&content);
+        let lower = scan_window.to_lowercase();
+        for keyword in KEYWORDS {
+            if lower.contains(keyword) {
+                return Some((filename.to_string(), keyword.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Sprint 138 — Deprecation Demotion Post-Filter.
+///
+/// When the scan target is a deprecated / archived / community-only project,
+/// every finding is demoted to `Informational` severity with the reason
+/// appended to the `remediation` field. The findings remain in the output
+/// (for LOW_YIELD ledger routing as negative training data) but are no
+/// longer eligible for promotion to CANDIDATE or BOUNTY.
+fn apply_deprecation_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    if findings.is_empty() {
+        return;
+    }
+    let Some((filename, keyword)) = is_deprecated_target(dir) else {
+        return;
+    };
+    let marker = format!(
+        " [deprecated_target: {filename}=\"{keyword}\"] informational_only_per_scope_exclusion"
+    );
+    for finding in findings.iter_mut() {
+        finding.severity = Some("Informational".to_string());
+        let remediation = finding.remediation.take().unwrap_or_default();
+        finding.remediation = Some(format!("{remediation}{marker}"));
+    }
+}
+
+/// P2-16 — Protobuf Any Reachability Post-Filter.
+///
+/// Demotes `security:protobuf_any_type_field` findings to `Informational`
+/// (LOW_YIELD routing) when the repository contains no evidence of an
+/// `Any::unpack`, `Any::decode`, or `unpackTo` call without an adjacent
+/// type-url allowlist guard.  The proto file itself defines the schema;
+/// exploitability requires a consumer that decodes the `Any` field.
+///
+/// **Allowlist guard patterns** (within 30 source lines of the decode call):
+/// - `type_url_allowlist`, `RegisteredTypes`, `getTypeRegistry`
+/// - An exhaustive `match` over `@type` URL constants
+///
+/// If no decode evidence is found at all, all `protobuf_any_type_field`
+/// findings are demoted — the field exists but is not consumed in this repo.
+fn apply_protobuf_any_reachability_demotion(dir: &Path, findings: &mut [StructuredFinding]) {
+    const RULE: &str = "security:protobuf_any_type_field";
+    if !findings.iter().any(|f| f.id == RULE) {
+        return;
+    }
+
+    // Decode-call patterns in implementation files.
+    let decode_patterns: &[&[u8]] = &[
+        b"unpackTo",
+        b"Any.parseFrom",
+        b"Any::decode",
+        b"any.unpack",
+        b".unpack(",
+        b"TypeRegistry",
+        b"proto.Any",
+        b"google.protobuf.any",
+    ];
+    // Allowlist guard patterns that suppress the finding when nearby.
+    let guard_patterns: &[&[u8]] = &[
+        b"type_url_allowlist",
+        b"RegisteredTypes",
+        b"getTypeRegistry",
+        b"allowedTypes",
+        b"knownTypes",
+        b"match @type",
+        b"match type_url",
+    ];
+
+    // Scan implementation files for decode + guard evidence.
+    let has_unguarded_decode = 'search: {
+        for entry in walkdir::WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let ext = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if !matches!(
+                ext,
+                "go" | "java" | "kt" | "py" | "rs" | "ts" | "js" | "rb" | "cs" | "cpp"
+            ) {
+                continue;
+            }
+            if std::fs::metadata(entry.path())
+                .map(|m| m.len() > MAX_FILE_BYTES)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(src) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let has_decode = decode_patterns
+                .iter()
+                .any(|p| src.windows(p.len()).any(|w| w == *p));
+            if !has_decode {
+                continue;
+            }
+            // Decode call found — check for nearby allowlist guard.
+            let has_guard = guard_patterns
+                .iter()
+                .any(|p| src.windows(p.len()).any(|w| w == *p));
+            if !has_guard {
+                // Unguarded decode call found — finding is reachable.
+                break 'search true;
+            }
+        }
+        false
+    };
+
+    if !has_unguarded_decode {
+        for finding in findings.iter_mut() {
+            if finding.id == RULE {
+                finding.severity = Some("Informational".to_string());
+            }
+        }
+    }
+}
+
+/// P2-16 — Proto Schema Demotion.
+///
+/// Demotes `security:protobuf_any_unguarded_decode` findings to `Informational`
+/// when the finding's source file has a `.proto` extension.  Proto schema files
+/// define message types — they do not decode Any fields themselves.  Exploitability
+/// requires a reachable Go (or Java/C++) consumer that calls an Unmarshal API;
+/// a finding in a `.proto` file alone provides no proven runtime decode path.
+fn apply_p2_16_protobuf_demotion(findings: &mut [StructuredFinding]) {
+    const RULE: &str = "security:protobuf_any_unguarded_decode";
+    for finding in findings.iter_mut() {
+        if finding.id != RULE {
+            continue;
+        }
+        let is_proto_schema = finding
+            .file
+            .as_deref()
+            .and_then(|f| std::path::Path::new(f).extension())
+            .and_then(|e| e.to_str())
+            == Some("proto");
+        if is_proto_schema {
+            finding.severity = Some("Informational".to_string());
+        }
+    }
+}
+
+/// P2-17 — Config-Backed SSRF Demotion Post-Filter.
+///
+/// Demotes `security:ssrf_dynamic_url` findings to `Informational` when the
+/// source file is a recognized operator-config module and no internal-metadata
+/// evidence marker is present.  Config modules set service hostnames from env
+/// vars or static structs; they are operator-controlled, not attacker-controlled.
+///
+/// Demoted when ALL of the following hold:
+/// - The file path indicates a config module (path segment or name contains
+///   `config`, `settings`, `env`, or `options`).
+/// - The finding has no `internal_metadata:` evidence marker (proven SSRF).
+/// - The finding `upstream_validation_absent` flag was not set by taint analysis.
+fn apply_config_backed_ssrf_demotion(findings: &mut [StructuredFinding]) {
+    const RULE: &str = "ssrf_dynamic_url";
+    for finding in findings.iter_mut() {
+        if !finding.id.contains(RULE) {
+            continue;
+        }
+        // Concrete SSRF (proven internal metadata target): never demote.
+        if finding
+            .web_proof_artifact
+            .as_ref()
+            .is_some_and(|a| a.has_marker("internal_metadata"))
+        {
+            continue;
+        }
+        let file = finding.file.as_deref().unwrap_or("");
+        if is_config_module_path(file) {
+            finding.severity = Some("Informational".to_string());
+            finding.upstream_validation_absent = false;
+        }
+    }
+}
+
+/// Returns `true` when `path` indicates an operator-configuration module
+/// (not a request-handler or business-logic file).
+fn is_config_module_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    // Segment-level config indicators (avoid over-matching "reconfiguration" etc.)
+    let segments: Vec<&str> = p.split(['/', '\\', '.']).collect();
+    segments.iter().any(|s| {
+        matches!(
+            *s,
+            "config" | "configuration" | "settings" | "options" | "conf"
+        )
+    }) || p.ends_with("config.go")
+        || p.ends_with("config.py")
+        || p.ends_with("config.ts")
+        || p.ends_with("config.js")
+        || p.ends_with("settings.py")
+        || p.ends_with("settings.go")
+        || p.ends_with(".env")
 }
 
 fn has_ai_assistant_config(root: &Path) -> bool {
@@ -2729,10 +3700,110 @@ fn byte_to_line(source: &[u8], byte_offset: usize) -> u32 {
     source[..capped].iter().filter(|&&b| b == b'\n').count() as u32 + 1
 }
 
+fn attach_web_proof_artifact(
+    structured: &mut StructuredFinding,
+    witness: &ExploitWitness,
+    evidence_marker: Option<String>,
+) {
+    let proof_class = ProofClass::ReachabilityProof;
+    structured.proof_class = Some(proof_class);
+    structured.web_proof_artifact = Some(WebProofArtifact::from_witness(
+        witness,
+        proof_class,
+        evidence_marker,
+    ));
+}
+
+fn attach_memory_safety_witness_if_needed(finding: StructuredFinding) -> StructuredFinding {
+    if !is_memory_safety_witness_id(&finding.id) || finding.exploit_witness.is_some() {
+        return finding;
+    }
+    let file = finding.file.as_deref().unwrap_or("unknown");
+    let line = finding.line.unwrap_or(1);
+    let boundary = memory_boundary_from_id(&finding.id);
+    let witness =
+        forge::exploitability::cross_language_memory_witness(file, &finding.id, line, boundary);
+    forge::exploitability::attach_exploit_witness(finding, witness)
+}
+
+fn is_memory_safety_witness_id(id: &str) -> bool {
+    id.contains("lcm_")
+        || id == "security:c_double_free"
+        || id == "security:public_ffi_unsafe_deref"
+        || id == "security:protobuf_any_unguarded_decode"
+}
+
+fn memory_boundary_from_id(id: &str) -> Option<String> {
+    if id.contains("protobuf_any") {
+        Some("google.protobuf.Any".to_string())
+    } else if id.contains("public_ffi") {
+        Some("extern_C_raw_pointer".to_string())
+    } else if id.contains("double_free") {
+        Some("heap_lifetime:free/free".to_string())
+    } else {
+        None
+    }
+}
+
+fn attach_agent_deception_witness_if_needed(finding: StructuredFinding) -> StructuredFinding {
+    if !is_agent_deception_witness_id(&finding.id) || finding.exploit_witness.is_some() {
+        return finding;
+    }
+    let file = finding.file.as_deref().unwrap_or("unknown");
+    let line = finding.line.unwrap_or(1);
+    let (declared, observed) = agent_intent_labels_from_id(&finding.id);
+    let witness =
+        forge::exploitability::agent_deception_witness(file, &finding.id, line, declared, observed);
+    forge::exploitability::attach_exploit_witness(finding, witness)
+}
+
+fn is_agent_deception_witness_id(id: &str) -> bool {
+    matches!(
+        id,
+        "security:intent_divergence"
+            | "security:swarm_context_exfiltration"
+            | "security:agent_intent_misalignment"
+    )
+}
+
+fn agent_intent_labels_from_id(id: &str) -> (Option<String>, Option<String>) {
+    match id {
+        "security:intent_divergence" => (
+            Some("security_claim".to_string()),
+            Some("vacuous_allow".to_string()),
+        ),
+        "security:swarm_context_exfiltration" => (
+            Some("developer_context".to_string()),
+            Some("context_exfiltration_marker".to_string()),
+        ),
+        "security:agent_intent_misalignment" => (
+            Some("declared_tool_policy".to_string()),
+            Some("tool_capability_escape".to_string()),
+        ),
+        _ => (None, None),
+    }
+}
+
+fn ssrf_evidence_marker(text: &str) -> Option<String> {
+    const INTERNAL_TARGETS: &[&str] = &[
+        "169.254.169.254",
+        "metadata.google.internal",
+        "100.100.100.200",
+        "127.0.0.1",
+        "localhost",
+    ];
+
+    INTERNAL_TARGETS
+        .iter()
+        .find(|needle| text.contains(**needle))
+        .map(|needle| format!("internal_metadata:{needle}"))
+}
+
 fn scan_buffer(
     ext: &str,
     source: &[u8],
     label: &str,
+    controller_surfaces: &[forge::authz::EndpointSurfaceMatch],
     frontend_routes: &[forge::authz::FrontendRoute],
     has_ai_assistant_config: bool,
 ) -> Vec<StructuredFinding> {
@@ -2745,7 +3816,7 @@ fn scan_buffer(
     // documentation URLs and form-schema links, not production asset loads.
     // Suppress supply-chain and OAuth FPs for these non-executable paths.
     let is_issue_template = label.contains("ISSUE_TEMPLATE");
-    let mut slop_findings = find_slop(ext, &unit);
+    let mut slop_findings = find_slop(ext, &unit, label);
     slop_findings.extend(forge::slop_hunter::find_generative_build_execution(
         label, ext, source,
     ));
@@ -2764,6 +3835,7 @@ fn scan_buffer(
         .into_iter()
         .filter(|f| {
             !forge::slop_hunter::is_hunt_false_positive_path(label, &f.description)
+                && !should_demote_unpinned_asset(label, &f.description, source)
                 && (!is_issue_template
                     || (!f.description.contains("unpinned_asset")
                         && !f.description.contains("oauth_excessive_scope")))
@@ -2778,9 +3850,10 @@ fn scan_buffer(
                 || rule_id.contains("command_injection")
                 || rule_id.contains("path_traversal")
                 || rule_id.contains("oracle_price_manipulation")
-                || rule_id.contains("flash_loan_callback");
+                || rule_id.contains("flash_loan_callback")
+                || rule_id == "security:react_xss_dangerous_html";
             let mut structured = StructuredFinding {
-                id: rule_id.clone(),
+                id: rule_id.to_string(),
                 file: Some(label.to_string()),
                 line: Some(line),
                 fingerprint: fingerprint_finding(source, finding.start_byte, finding.end_byte),
@@ -2791,24 +3864,49 @@ fn scan_buffer(
                 upstream_validation_absent,
                 ..Default::default()
             };
+            let ingress_surface =
+                ingress_surface_for_finding(&rule_id, label, line, controller_surfaces);
             if rule_id == "security:dom_xss_innerHTML" || rule_id.contains("prototype_pollution") {
                 let mut witness =
                     forge::exploitability::browser_sink_witness(label, &rule_id, line);
+                let mut evidence_marker = None;
+                if finding.description.contains("schema_taint:proven") {
+                    witness.path_proof = Some("schema_taint:proven".to_string());
+                    evidence_marker = Some("schema_taint:proven".to_string());
+                }
                 if let Some(route) =
                     forge::authz::match_frontend_route_for_file(frontend_routes, label)
                 {
                     witness.route_path = Some(route.route_path.clone());
                 }
+                attach_web_proof_artifact(&mut structured, &witness, evidence_marker);
+                structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if rule_id == "security:react_xss_dangerous_html" {
+                // P2-5: Dual-frame stored XSS witness — Frame 1 writes payload, Frame 2 renders.
+                let route = forge::authz::match_frontend_route_for_file(frontend_routes, label)
+                    .map(|r| r.route_path.clone());
+                let witness = forge::exploitability::stored_xss_dual_frame_witness(
+                    label, &rule_id, line, route,
+                );
+                let evidence_marker =
+                    Some("schema_taint:proven stored:cross_user_render".to_string());
+                attach_web_proof_artifact(&mut structured, &witness, evidence_marker);
+                structured.upstream_validation_absent = true;
                 structured = forge::exploitability::attach_exploit_witness(structured, witness);
             } else if rule_id == "security:jwt_validation_bypass" {
-                let witness =
+                let mut witness =
                     forge::exploitability::protocol_bypass_witness(label, &rule_id, line, None);
+                apply_ingress_surface(&mut structured, &mut witness, ingress_surface.as_ref());
                 structured = forge::exploitability::attach_exploit_witness(structured, witness);
             } else if rule_id == "security:ssrf_dynamic_url" {
                 let method = extract_go_http_method(&finding.description);
                 let parameter = extract_go_url_parameter(&finding.description);
-                let witness =
+                let mut witness =
                     forge::exploitability::ssrf_witness(label, &rule_id, line, method, parameter);
+                apply_ingress_surface(&mut structured, &mut witness, ingress_surface.as_ref());
+                let evidence_marker = ssrf_evidence_marker(&finding.description)
+                    .or_else(|| witness.repro_cmd.as_deref().and_then(ssrf_evidence_marker));
+                attach_web_proof_artifact(&mut structured, &witness, evidence_marker);
                 structured = forge::exploitability::attach_exploit_witness(structured, witness);
             } else if rule_id == "security:unsafe_string_function" {
                 let witness = forge::exploitability::memory_unsafety_witness(
@@ -2916,10 +4014,116 @@ fn scan_buffer(
                     label, &rule_id, line, model_api,
                 );
                 structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if rule_id == "security:embedding_trust_transposition" {
+                let witness = ExploitWitness {
+                    source_function: label.to_string(),
+                    source_label: "rag_chunk:scraped_text".to_string(),
+                    sink_function: label.to_string(),
+                    sink_label: "sink:llm.invoke".to_string(),
+                    call_chain: vec![
+                        format!("{label}:{line}"),
+                        "vector_query".to_string(),
+                        "llm.invoke".to_string(),
+                    ],
+                    path_proof: Some(
+                        "ifds:web_proof_artifact rag_chunk:scraped_text -> llm.invoke".to_string(),
+                    ),
+                    ..Default::default()
+                };
+                attach_web_proof_artifact(
+                    &mut structured,
+                    &witness,
+                    Some("rag_trust:unprioritized_retrieval".to_string()),
+                );
+                structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if rule_id == "security:vector_store_poisoning" {
+                let witness = ExploitWitness {
+                    source_function: label.to_string(),
+                    source_label: "rag_chunk:vector_retrieval".to_string(),
+                    sink_function: label.to_string(),
+                    sink_label: "sink:llm.invoke".to_string(),
+                    call_chain: vec![
+                        format!("{label}:{line}"),
+                        "vector_query".to_string(),
+                        "retrieval_result".to_string(),
+                        "llm.invoke".to_string(),
+                    ],
+                    path_proof: Some(
+                        "ifds:web_proof_artifact rag_chunk:vector_retrieval -> llm.invoke"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                };
+                attach_web_proof_artifact(
+                    &mut structured,
+                    &witness,
+                    Some("vector_topology:missing_similarity_gate".to_string()),
+                );
+                structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if rule_id == "security:vector_filter_polymorphism" {
+                let witness = forge::exploitability::vector_filter_polymorphism_witness(
+                    label, &rule_id, line, None,
+                );
+                attach_web_proof_artifact(
+                    &mut structured,
+                    &witness,
+                    Some("vector_filter:tenant_predicate_polymorphism".to_string()),
+                );
+                structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if rule_id == "security:missing_ownership_check" {
+                let mut witness = forge::exploitability::authorization_ownership_witness(
+                    label, &rule_id, line, None, None,
+                );
+                apply_ingress_surface(&mut structured, &mut witness, ingress_surface.as_ref());
+                structured = forge::exploitability::attach_exploit_witness(structured, witness);
+            } else if is_memory_safety_witness_id(&rule_id) {
+                structured = attach_memory_safety_witness_if_needed(structured);
+            } else if is_agent_deception_witness_id(&rule_id) {
+                structured = attach_agent_deception_witness_if_needed(structured);
+            }
+            if matches!(
+                rule_id.as_str(),
+                "security:missing_ownership_check" | "security:missing_authz_check"
+            ) || rule_id == "security:jwt_validation_bypass"
+                || rule_id.contains("sqli")
+            {
+                if let Some(mut witness) = structured.exploit_witness.take() {
+                    apply_ingress_surface(&mut structured, &mut witness, ingress_surface.as_ref());
+                    structured.exploit_witness = Some(witness);
+                } else if let Some(surface) = ingress_surface.as_ref() {
+                    structured.auth_requirement = Some(format_supported_ingress(surface));
+                }
             }
             structured
         })
         .collect::<Vec<_>>();
+    findings.extend(forge::model_pinning::detect_unpinned_model_revisions(
+        ext, source, label,
+    ));
+    findings.extend(forge::stego_binary::detect_embedded_executable_blob(
+        source, label,
+    ));
+    findings.extend(
+        forge::llm_decompile::detect_agent_intent_misalignment(ext, source, label)
+            .into_iter()
+            .map(attach_agent_deception_witness_if_needed),
+    );
+    findings.extend(forge::dataset_poisoning::detect_training_data_trojan(
+        ext, source, label,
+    ));
+    findings.extend(forge::ics_rules::detect_ics_hazards(ext, source, label));
+    findings.extend(forge::automotive::detect_can_bus_unvalidated_actuation(
+        ext, source, label,
+    ));
+    // P8-3: Medical Device Pack — PHI-to-LLM taint + FDA audit-log absence.
+    // Wired for Python, JavaScript, TypeScript, Java, Kotlin, C#.
+    if matches!(ext, "py" | "js" | "ts" | "java" | "kt" | "cs") {
+        let src_str = std::str::from_utf8(source).unwrap_or("");
+        findings.extend(forge::medical::emit_phi_sink_findings(src_str, label));
+        findings.extend(forge::medical::emit_audit_log_absence_findings(
+            src_str, label,
+        ));
+    }
     let filename = std::path::Path::new(label)
         .file_name()
         .and_then(|n| n.to_str())
@@ -2935,12 +4139,189 @@ fn scan_buffer(
     findings.extend(forge::agentic_tool_audit::find_bare_metal_agentic_loops(
         ext, source, label,
     ));
+    findings.extend(
+        forge::noninterference::prove_prompt_tool_non_interference(source)
+            .into_iter()
+            .map(|mut finding| {
+                if finding.file.is_none() {
+                    finding.file = Some(label.to_string());
+                }
+                finding
+            }),
+    );
+    findings.extend(
+        forge::dma_revocation::detect_dma_revocation_shadow_access(source)
+            .into_iter()
+            .map(|mut finding| {
+                if finding.file.is_none() {
+                    finding.file = Some(label.to_string());
+                }
+                finding
+            }),
+    );
     if filename == "build.rs" {
         findings.extend(forge::rust_build_worm::find_cargo_build_worm_slop(
             label, source,
         ));
     }
     findings.extend(forge::idor::scan_source(ext, source, label));
+    // Deobfuscation pre-pass: decode base64/hex/concat payloads before pattern detectors run.
+    let normalized = forge::deobfuscate::normalize_payload(source);
+    let source = normalized.as_deref().unwrap_or(source);
+    let source_str = std::str::from_utf8(source).unwrap_or("");
+    // Oracle: invisible Unicode payload scanner (trojan source / steganographic characters).
+    if matches!(
+        label.rsplit('.').next().unwrap_or(""),
+        "py" | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "rs"
+            | "go"
+            | "java"
+            | "kt"
+            | "swift"
+            | "rb"
+            | "php"
+            | "lua"
+            | "sh"
+            | "bash"
+            | "ps1"
+            | "cs"
+            | "cpp"
+            | "c"
+            | "h"
+    ) {
+        findings.extend(
+            forge::invisible_payload::scan_invisible_payloads(source, false)
+                .into_iter()
+                .map(|f| StructuredFinding {
+                    id: extract_rule_id(&f.description),
+                    severity: Some(format!("{:?}", f.severity)),
+                    file: Some(label.to_string()),
+                    line: Some(byte_to_line(source, f.start_byte)),
+                    ..Default::default()
+                }),
+        );
+    }
+    findings
+        .extend(forge::mcp_dispatch_guard::emit_mcp_confused_deputy_findings(source_str, label));
+    if (label.ends_with(".yml") || label.ends_with(".yaml")) && source_str.contains("jobs:") {
+        findings.extend(forge::workflow_evidence::emit_workflow_provenance_finding(
+            label, source_str,
+        ));
+    }
+    findings.extend(forge::debug_endpoint_guard::emit_debug_endpoint_findings(
+        source_str, label,
+    ));
+    findings.extend(forge::linker_hijack::emit_linker_hijack_findings(
+        source_str, label,
+    ));
+    findings.extend(forge::financial_pii::emit_financial_pii_to_llm_findings(
+        Some(label),
+        source_str,
+    ));
+    findings.extend(forge::ffi_taint::detect_ffi_boundary_violations(
+        source_str, label,
+    ));
+    findings.extend(forge::java_deser_guard::emit_java_deser_findings(
+        source_str, label,
+    ));
+    findings.extend(
+        forge::llm_prompt_injection::find_llm_unbounded_prompt_concat(Some(label), source_str),
+    );
+    findings.extend(forge::oidc_scope_guard::emit_oidc_scope_findings(
+        source_str, label,
+    ));
+    findings.extend(
+        forge::embedding_trust::detect_embedding_trust_transposition(source_str.as_bytes())
+            .into_iter()
+            .map(|f| StructuredFinding {
+                id: f.description.clone(),
+                severity: Some(format!("{:?}", f.severity)),
+                file: Some(label.to_string()),
+                ..Default::default()
+            }),
+    );
+    findings.extend(forge::lcm::emit_cross_language_memory_witnesses(
+        source_str, label,
+    ));
+    findings.extend(forge::agent_intent::emit_agent_intent_guard_findings(
+        source_str, label,
+    ));
+    findings.extend(forge::bayesian_taint::find_probabilistic_llm_hijacks(
+        source_str.as_bytes(),
+    ));
+    findings.extend(
+        forge::oauth_account_fusion::detect_oauth_account_fusion(source)
+            .into_iter()
+            .map(|f| StructuredFinding {
+                id: f.description.clone(),
+                severity: Some(format!("{:?}", f.severity)),
+                file: Some(label.to_string()),
+                proof_class: Some(common::slop::ProofClass::LatticeGapProposal),
+                ..Default::default()
+            }),
+    );
+    if matches!(
+        ext,
+        "py" | "js" | "ts" | "tsx" | "rb" | "go" | "java" | "php" | "kt"
+    ) {
+        findings.extend(
+            forge::oauth_account_fusion::detect_missing_state_validation(source, label)
+                .into_iter()
+                .map(|f| StructuredFinding {
+                    id: f.description.clone(),
+                    severity: Some(format!("{:?}", f.severity)),
+                    file: Some(label.to_string()),
+                    proof_class: Some(common::slop::ProofClass::ReachabilityProof),
+                    ..Default::default()
+                }),
+        );
+    }
+    findings.extend(forge::solidity_taint::find_solidity_slop(source));
+    findings.extend(
+        forge::config_taint::track_config_taint_js(source)
+            .into_iter()
+            .map(|f| common::slop::StructuredFinding {
+                id: format!("security:config_taint_{}", f.property_path),
+                severity: Some("High".to_string()),
+                file: Some(label.to_string()),
+                proof_class: Some(common::slop::ProofClass::LatticeGapProposal),
+                ..Default::default()
+            }),
+    );
+    // LLM load provenance: Python/JS/TS/notebook only — Rust test strings contain
+    // these patterns as literals and trigger false positives on .rs diffs.
+    if matches!(
+        label.rsplit('.').next().unwrap_or(""),
+        "py" | "ipynb" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx"
+    ) {
+        findings.extend(forge::model_lineage::emit_llm_model_provenance_findings(
+            source_str, label,
+        ));
+    }
+
+    // Malware genome extraction — baseline for corpus comparison in Sprint 137.
+    if let Some(genome) =
+        forge::malware_genome::extract_genome(source, label.rsplit('.').next().unwrap_or(""))
+    {
+        let _ = genome;
+    }
+
+    // Browser extension MV3 over-permission and MV2-compat-shim detector.
+    if filename == "manifest.json" {
+        findings.extend(forge::browser_ext::emit_browser_ext_findings(
+            source_str, label,
+        ));
+    }
+
+    // Neural model weight backdoor scanner (Phase A: header anomaly detection).
+    if label.ends_with(".safetensors") {
+        findings.extend(forge::model_backdoor::emit_model_backdoor_findings(
+            source, label,
+        ));
+    }
 
     // Repojacking & unpinned Git dependency shield: scan manifest files.
     if matches!(
@@ -2955,7 +4336,7 @@ fn scan_buffer(
             let line = byte_to_line(source, f.start_byte);
             let rule_id = extract_rule_id(&f.description);
             let mut structured = StructuredFinding {
-                id: rule_id.clone(),
+                id: rule_id.to_string(),
                 file: Some(label.to_string()),
                 line: Some(line),
                 fingerprint: fingerprint_finding(source, f.start_byte, f.end_byte),
@@ -2981,7 +4362,222 @@ fn scan_buffer(
         }
     }
 
+    // P6-9 Phase A: swarm context-window exfiltration marker scan.
+    // Applied to all text files — agentic IPC markers can appear in any
+    // source language, commit-message templates, or CI YAML artifacts.
+    if !is_compiled_artifact_extension(ext) {
+        findings.extend(
+            forge::swarm_exfil::detect_context_exfil(source, label)
+                .into_iter()
+                .map(attach_agent_deception_witness_if_needed),
+        );
+    }
+
+    // P2-16: Go AST dominance — unguarded Protobuf Any decode call sites.
+    findings.extend(
+        forge::taint_catalog::find_protobuf_any_reachability(ext, source, label)
+            .into_iter()
+            .map(|mut f| {
+                if f.file.is_none() {
+                    f.file = Some(label.to_string());
+                }
+                attach_memory_safety_witness_if_needed(f)
+            }),
+    );
+
+    // P2-7: Rust public FFI unsafe pointer dereference (0-hop reachability).
+    findings.extend(
+        forge::taint_catalog::collect_rust_call_graph_edges(ext, source, label)
+            .into_iter()
+            .map(|mut f| {
+                if f.file.is_none() {
+                    f.file = Some(label.to_string());
+                }
+                attach_memory_safety_witness_if_needed(f)
+            }),
+    );
+
+    // P2-15 Phase A: CFG-aware C double-free witness.
+    findings.extend(
+        forge::taint_catalog::find_c_double_free_witness(ext, source, label)
+            .into_iter()
+            .map(|mut f| {
+                if f.file.is_none() {
+                    f.file = Some(label.to_string());
+                }
+                attach_memory_safety_witness_if_needed(f)
+            }),
+    );
+
+    apply_p2_11_ci_sink_demotion(label, &mut findings);
+
+    // P2-12: Demote embedding_trust_transposition when RAG answer-sink dataflow is not proven.
+    // A vector-query call present in the file is insufficient for a bounty-grade finding;
+    // the query result variable must structurally flow into a downstream LLM invoke call.
+    if matches!(ext, "py" | "ts" | "js" | "go") {
+        let dataflow_proven =
+            forge::vector_topology::requires_rag_answer_sink_dataflow(source, ext);
+        if !dataflow_proven {
+            for f in findings.iter_mut() {
+                if f.id == "security:embedding_trust_transposition" {
+                    f.severity = Some("Informational".to_string());
+                }
+            }
+        }
+    }
+
+    apply_p2_14_vendored_dom_demotion(label, ext, source, &mut findings);
+
     findings
+}
+
+/// P2-14 demotion lattice: a `security:dom_xss_innerHTML` finding whose
+/// source file path is a vendored, bundled, or minified third-party
+/// library is demoted to `Informational` unless the file *also* contains
+/// a repository-native dynamic DOM reflection witness (an `innerHTML` /
+/// `outerHTML` assignment whose RHS is structurally proven dynamic — an
+/// identifier, call expression, or template string with substitutions).
+///
+/// Vendor bundles routinely emit `innerHTML = '<vendor template>'`
+/// patterns by design; with no proven attacker-controlled data injection
+/// the finding has no exploit path and is not bounty-grade.
+fn apply_p2_14_vendored_dom_demotion(
+    label: &str,
+    ext: &str,
+    source: &[u8],
+    findings: &mut [StructuredFinding],
+) {
+    if !forge::slop_hunter::is_vendored_library_path(label) {
+        return;
+    }
+    let proven = forge::slop_hunter::has_repository_native_dom_reflection(source, ext);
+    if proven {
+        return;
+    }
+    for finding in findings.iter_mut() {
+        if finding.id == "security:dom_xss_innerHTML" {
+            finding.severity = Some("Informational".to_string());
+        }
+    }
+}
+
+/// P2-11 demotion lattice: any finding whose file path identifies a CI
+/// pipeline, build helper, devops automation, or test runner is demoted to
+/// `Informational` unless a remote ingress node (HTTP route or public API
+/// endpoint) has been resolved and recorded in `exploit_witness.route_path`.
+///
+/// Local shell access is required to trigger these sinks; they cannot be
+/// exercised by an unauthenticated remote attacker.
+fn apply_p2_11_ci_sink_demotion(label: &str, findings: &mut [StructuredFinding]) {
+    if !forge::slop_hunter::is_ci_or_local_script_path(label) {
+        return;
+    }
+    for finding in findings.iter_mut() {
+        let has_remote_ingress = finding
+            .exploit_witness
+            .as_ref()
+            .and_then(|w| w.route_path.as_ref())
+            .is_some();
+        if !has_remote_ingress {
+            finding.severity = Some("Informational".to_string());
+        }
+    }
+}
+
+fn ingress_surface_for_finding(
+    rule_id: &str,
+    file: &str,
+    line: u32,
+    controller_surfaces: &[forge::authz::EndpointSurfaceMatch],
+) -> Option<forge::authz::EndpointSurface> {
+    if !(matches!(
+        rule_id,
+        "security:missing_ownership_check"
+            | "security:missing_authz_check"
+            | "security:jwt_validation_bypass"
+    ) || rule_id.contains("sqli"))
+    {
+        return None;
+    }
+
+    let file_matches = controller_surfaces
+        .iter()
+        .filter(|surface| surface.surface.file == file)
+        .cloned()
+        .collect::<Vec<_>>();
+    forge::authz::match_surface_for_witness(&file_matches, file, Some(line))
+        .map(|entry| entry.surface.clone())
+}
+
+fn apply_ingress_surface(
+    structured: &mut StructuredFinding,
+    witness: &mut ExploitWitness,
+    surface: Option<&forge::authz::EndpointSurface>,
+) {
+    let Some(surface) = surface else {
+        return;
+    };
+
+    witness.route_path = Some(surface.route_path.clone());
+    witness.http_method = Some(surface.http_method.clone());
+    witness.auth_requirement = Some(format_supported_ingress(surface));
+    structured.auth_requirement = witness.auth_requirement.clone();
+}
+
+fn format_supported_ingress(surface: &forge::authz::EndpointSurface) -> String {
+    let boundary = surface
+        .auth_requirement
+        .as_deref()
+        .map(compact_auth_requirement)
+        .map(|auth| format!("authenticated_endpoint auth={auth}"))
+        .unwrap_or_else(|| "public_api".to_string());
+    format!("{boundary} {} {}", surface.http_method, surface.route_path)
+}
+
+fn compact_auth_requirement(auth: &str) -> String {
+    let trimmed = auth.trim();
+    if let Some(start) = trimmed.find('"') {
+        if let Some(end) = trimmed[start + 1..].find('"') {
+            return trimmed[start + 1..start + 1 + end].to_string();
+        }
+    }
+    if let Some(start) = trimmed.find('\'') {
+        if let Some(end) = trimmed[start + 1..].find('\'') {
+            return trimmed[start + 1..start + 1 + end].to_string();
+        }
+    }
+    trimmed
+        .trim_start_matches("ROLE_")
+        .trim_start_matches("role:")
+        .to_string()
+}
+
+fn should_demote_unpinned_asset(label: &str, description: &str, source: &[u8]) -> bool {
+    if !description.contains("unpinned_asset") {
+        return false;
+    }
+
+    let lower = format!(
+        "{label}\n{description}\n{}",
+        String::from_utf8_lossy(source)
+    )
+    .to_ascii_lowercase();
+    [
+        "sandbox",
+        "staging",
+        "example",
+        "examples",
+        "demo",
+        "sample",
+        "mock",
+        "test/",
+        "test-",
+        "localhost",
+        "127.0.0.1",
+        "sdk-example-server",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn is_compiled_artifact_extension(ext: &str) -> bool {
@@ -3558,6 +5154,192 @@ def main(user_id):
         assert!(report.contains(
             "**Remediation Advice:** Replace innerHTML with textContent or a vetted sanitizer."
         ));
+    }
+
+    #[test]
+    fn bugcrowd_formatter_renders_unified_web_proof_artifact() {
+        let finding = StructuredFinding {
+            id: "security:dom_xss_innerHTML".to_string(),
+            file: Some("static/app.js".to_string()),
+            line: Some(42),
+            fingerprint: "webproof123".to_string(),
+            severity: Some("Critical".to_string()),
+            proof_class: Some(common::slop::ProofClass::ReachabilityProof),
+            web_proof_artifact: Some(common::slop::WebProofArtifact {
+                source_label: "url_param:returnTo".to_string(),
+                sink_label: "sink:innerHTML".to_string(),
+                ifds_trace: vec!["router.parse".to_string(), "render".to_string()],
+                evidence_marker: Some("schema_taint:proven".to_string()),
+                proof_class: common::slop::ProofClass::ReachabilityProof,
+            }),
+            upstream_validation_absent: true,
+            ..Default::default()
+        };
+
+        let report = format_bugcrowd_report(&[finding]);
+        assert!(
+            report.contains("WebProofArtifact: `url_param:returnTo` -> `sink:innerHTML`"),
+            "Bugcrowd markdown must use the unified web proof artifact"
+        );
+        assert!(
+            report.contains("url_param:returnTo -> router.parse -> render -> sink:innerHTML"),
+            "IFDS output must bind the external source to the execution sink"
+        );
+        assert!(
+            report.contains("schema_taint:proven"),
+            "compact evidence marker must survive formatting"
+        );
+        assert!(
+            !report.contains("Acceptance Oracle: proof-complete"),
+            "candidate gap section must not emit redundant proof-complete prose when an artifact exists"
+        );
+    }
+
+    #[test]
+    fn scan_buffer_attaches_web_proof_artifact_for_vector_store_poisoning() {
+        let source = br#"
+async function answer(req) {
+  const results = await pinecone.query({ vector: embed(req.body.prompt), topK: 6 });
+  return openai.chat.completions.create({
+    messages: [{ role: "user", content: results.matches[0].metadata.page_content }]
+  });
+}
+"#;
+
+        let findings = scan_buffer("ts", source, "src/rag.ts", &[], &[], false);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "security:vector_store_poisoning")
+            .expect("vector store poisoning finding must be emitted");
+
+        let artifact = finding
+            .web_proof_artifact
+            .as_ref()
+            .expect("vector store poisoning finding must carry a web proof artifact");
+        assert_eq!(artifact.source_label, "rag_chunk:vector_retrieval");
+        assert_eq!(artifact.sink_label, "sink:llm.invoke");
+        assert!(artifact.has_marker("vector_topology:missing_similarity_gate"));
+    }
+
+    #[test]
+    fn scan_buffer_attaches_memory_witness_for_protobuf_any_decode() {
+        let source = br#"
+package handler
+import "google.golang.org/protobuf/types/known/anypb"
+func Handle(msg *anypb.Any) {
+    _, _ = anypb.UnmarshalNew(msg, nil)
+}
+"#;
+        let findings = scan_buffer("go", source, "handler/handler.go", &[], &[], false);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "security:protobuf_any_unguarded_decode")
+            .expect("protobuf Any decode finding must be emitted");
+        let witness = finding
+            .exploit_witness
+            .as_ref()
+            .expect("protobuf Any finding must carry an exploit witness");
+        assert!(
+            witness.memory_safety_witness.is_some(),
+            "protobuf Any finding must carry cross-language memory evidence"
+        );
+        assert!(
+            witness
+                .repro_cmd
+                .as_deref()
+                .is_some_and(|cmd| cmd.contains("CrossLanguageMemoryWitness/v1")),
+            "repro_cmd must encode the memory witness schema"
+        );
+    }
+
+    #[test]
+    fn scan_buffer_attaches_agent_deception_witness_for_intent_divergence() {
+        let source = br#"
+fn verify_signature() -> bool { true }
+"#;
+        let findings = scan_buffer("rs", source, "src/auth.rs", &[], &[], false);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "security:intent_divergence")
+            .expect("intent divergence finding must be emitted");
+        let witness = finding
+            .exploit_witness
+            .as_ref()
+            .expect("intent divergence finding must carry an exploit witness");
+        assert!(
+            witness.agent_deception_witness.is_some(),
+            "intent divergence must carry agent deception evidence"
+        );
+        assert!(
+            witness
+                .repro_cmd
+                .as_deref()
+                .is_some_and(|cmd| cmd.contains("AgentDeceptionWitness/v1")),
+            "repro_cmd must encode the agent deception schema"
+        );
+    }
+
+    #[test]
+    fn scan_buffer_attaches_supported_ingress_metadata_to_jwt_findings() {
+        let source = br#"
+const express = require("express");
+const router = express.Router();
+router.get("/api/tokens", ensureRole("ADMIN"), (req, res) => {
+  jwt.decode(req.headers.authorization, { complete: true });
+  res.json({ ok: true });
+});
+"#;
+        let controller_surfaces = forge::authz::extract_controller_surface_matches_for_file(
+            "js",
+            source,
+            "src/routes.js".to_string(),
+        );
+        let findings = scan_buffer(
+            "js",
+            source,
+            "src/routes.js",
+            &controller_surfaces,
+            &[],
+            false,
+        );
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "security:jwt_validation_bypass")
+            .expect("jwt validation bypass finding must be emitted");
+        assert_eq!(
+            finding.auth_requirement.as_deref(),
+            Some("authenticated_endpoint auth=ADMIN GET /api/tokens")
+        );
+        let witness = finding
+            .exploit_witness
+            .as_ref()
+            .expect("jwt finding must carry an exploit witness");
+        assert_eq!(witness.route_path.as_deref(), Some("/api/tokens"));
+        assert_eq!(witness.http_method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn scan_buffer_demotes_sandbox_unpinned_assets() {
+        let source = br#"
+enum Environment {
+  case sandbox
+}
+let bootstrap = "https://afterpay.github.io/sdk-example-server/widget-bootstrap.js"
+"#;
+        let findings = scan_buffer(
+            "swift",
+            source,
+            "Sources/Afterpay/Model/Environment.swift",
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.id.contains("unpinned_asset")),
+            "sandbox bootstrap assets must be demoted before ledger routing"
+        );
     }
 
     #[test]
@@ -4565,6 +6347,27 @@ class Handler {
     }
 
     #[test]
+    fn live_tenant_replay_adds_curl_timeouts() {
+        let cmd = "curl -i -X GET https://example.invalid/api/resources/123";
+        let bounded = bounded_curl_command(cmd);
+        assert!(bounded.contains("--connect-timeout 5"));
+        assert!(bounded.contains("--max-time 20"));
+        assert!(bounded.contains("--retry 0"));
+    }
+
+    #[test]
+    fn authorization_replay_verdict_distinguishes_200_from_denial() {
+        assert_eq!(
+            authorization_replay_verdict("HTTP/2 200\r\n\r\n{\"id\":\"user_b\"}"),
+            "potential_cross_tenant_read: replay returned 2xx"
+        );
+        assert_eq!(
+            authorization_replay_verdict("HTTP/1.1 403 Forbidden\r\n\r\n"),
+            "control_enforced: replay denied cross-principal object access"
+        );
+    }
+
+    #[test]
     fn browser_dom_harness_is_emitted_to_output_directory() {
         let temp = tempfile::tempdir().unwrap();
         let mut findings = vec![StructuredFinding {
@@ -4580,6 +6383,7 @@ class Handler {
                     "cat > janitor-auth0-dom-xss-poc.html <<'HTML'\n<!doctype html>\n<title>Harness</title>\n<script>console.log('ready')</script>\nHTML\npython3 -m http.server 8765"
                         .to_string(),
                 ),
+                reproduction_steps: Some(vec!["Serve the harness.".to_string()]),
                 live_proof: Some("Live tenant context injected.".to_string()),
                 ..Default::default()
             }),
@@ -4602,6 +6406,36 @@ class Handler {
                 .and_then(|w| w.live_proof.as_deref())
                 .is_some_and(|proof| proof.contains("BrowserDOM harness written to")),
             "live proof must mention the emitted harness path"
+        );
+    }
+
+    #[test]
+    fn browser_dom_harness_is_skipped_without_exploitation_strategy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut findings = vec![StructuredFinding {
+            id: "security:dom_xss_innerHTML".to_string(),
+            file: Some("src/auth0-widget.js".to_string()),
+            line: Some(44),
+            fingerprint: "domxss-low-evidence".to_string(),
+            severity: Some("High".to_string()),
+            exploit_witness: Some(common::slop::ExploitWitness {
+                repro_cmd: Some(
+                    "cat > janitor-auth0-dom-xss-poc.html <<'HTML'\n<!doctype html>\n<title>Harness</title>\n<script>console.log('ready')</script>\nHTML\npython3 -m http.server 8765"
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+
+        emit_browser_dom_harnesses(&mut findings, temp.path()).unwrap();
+
+        let emitted = temp
+            .path()
+            .join("janitor_poc_security_dom_xss_innerhtml.html");
+        assert!(
+            !emitted.exists(),
+            "low-evidence BrowserDOM harness must not be written"
         );
     }
 
@@ -4991,5 +6825,384 @@ class Handler {
             report.contains("Custom audit detail from IFDS trace."),
             "explicit sanitizer_audit must take priority over the IFDS proof statement"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2-11: apply_p2_11_ci_sink_demotion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p2_11_ci_path_command_injection_demoted_to_informational() {
+        // subprocess.run with shell=True triggers security:subprocess_shell_injection
+        let source = b"import subprocess\nsubprocess.run(cmd, shell=True)\n";
+        let findings = scan_buffer("py", source, "ci/build.py", &[], &[], false);
+        let shell_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.id.contains("shell_injection") || f.id.contains("command_injection"))
+            .collect();
+        assert!(
+            !shell_findings.is_empty(),
+            "subprocess shell=True must still produce a finding in ci/ path"
+        );
+        assert!(
+            shell_findings
+                .iter()
+                .all(|f| f.severity.as_deref() == Some("Informational")),
+            "command injection in ci/ path without ingress must be demoted to Informational"
+        );
+    }
+
+    #[test]
+    fn p2_11_production_path_command_injection_stays_critical() {
+        let source = b"import subprocess\nsubprocess.run(cmd, shell=True)\n";
+        let findings = scan_buffer("py", source, "src/server.py", &[], &[], false);
+        let shell_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.id.contains("shell_injection") || f.id.contains("command_injection"))
+            .collect();
+        assert!(
+            !shell_findings.is_empty(),
+            "subprocess shell=True must be detected in src/ path"
+        );
+        assert!(
+            shell_findings
+                .iter()
+                .all(|f| f.severity.as_deref() != Some("Informational")),
+            "command injection in src/server.py must not be demoted — production surface"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2-5: Stored XSS dual-frame witness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p2_5_react_xss_dangerous_html_gets_dual_frame_witness() {
+        let source = b"const el = <div dangerouslySetInnerHTML={{ __html: userContent }} />;\n";
+        let findings = scan_buffer("tsx", source, "src/components/Post.tsx", &[], &[], false);
+        let xss: Vec<_> = findings
+            .iter()
+            .filter(|f| f.id == "security:react_xss_dangerous_html")
+            .collect();
+        assert!(!xss.is_empty(), "dangerouslySetInnerHTML must fire");
+        let f = &xss[0];
+        assert!(
+            f.upstream_validation_absent,
+            "stored XSS must set upstream_validation_absent"
+        );
+        let artifact = f
+            .web_proof_artifact
+            .as_ref()
+            .expect("dual-frame witness must attach WebProofArtifact");
+        assert!(
+            artifact.has_marker("schema_taint:proven"),
+            "artifact must carry schema_taint:proven evidence marker"
+        );
+        let witness = f
+            .exploit_witness
+            .as_ref()
+            .expect("exploit witness must be present");
+        let repro = witness.repro_cmd.as_deref().unwrap_or("");
+        assert!(
+            repro.contains("JANITOR_XSS_CANARY"),
+            "repro_cmd must embed JANITOR_XSS_CANARY canary token"
+        );
+        assert!(
+            repro.contains("data-janitor-witness"),
+            "repro_cmd must embed data-janitor-witness attribute"
+        );
+        assert!(
+            repro.contains("Frame 1") && repro.contains("Frame 2"),
+            "repro_cmd must contain dual-frame structure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2-17: Config-Backed SSRF Demotion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p2_17_config_module_ssrf_demoted_to_informational() {
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:ssrf_dynamic_url".to_string(),
+            file: Some("src/config/api_config.go".to_string()),
+            severity: Some("KevCritical".to_string()),
+            upstream_validation_absent: false,
+            ..Default::default()
+        }];
+        apply_config_backed_ssrf_demotion(&mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("Informational"),
+            "SSRF in config module must be demoted to Informational"
+        );
+    }
+
+    #[test]
+    fn p2_17_production_handler_ssrf_stays_critical() {
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:ssrf_dynamic_url".to_string(),
+            file: Some("server/channels/app/admin.go".to_string()),
+            severity: Some("KevCritical".to_string()),
+            upstream_validation_absent: false,
+            ..Default::default()
+        }];
+        apply_config_backed_ssrf_demotion(&mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("KevCritical"),
+            "SSRF in production handler must not be demoted"
+        );
+    }
+
+    #[test]
+    fn p2_17_concrete_ssrf_with_internal_metadata_never_demoted() {
+        let artifact = common::slop::WebProofArtifact {
+            source_label: "url_param:url".to_string(),
+            sink_label: "sink:fetch".to_string(),
+            ifds_trace: vec![],
+            evidence_marker: Some("internal_metadata:169.254.169.254".to_string()),
+            proof_class: common::slop::ProofClass::ReachabilityProof,
+        };
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:ssrf_dynamic_url".to_string(),
+            file: Some("pkg/config/settings.go".to_string()),
+            severity: Some("KevCritical".to_string()),
+            web_proof_artifact: Some(artifact),
+            upstream_validation_absent: false,
+            ..Default::default()
+        }];
+        apply_config_backed_ssrf_demotion(&mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("KevCritical"),
+            "Concrete SSRF with internal_metadata marker must never be demoted even in config file"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprint 138 — Target Deprecation Cross-Check (is_deprecated_target +
+    // apply_deprecation_demotion). Mattermost-plugin-boards was the
+    // motivating case: scope file listed it as in-scope but the project had
+    // been transitioned to community maintenance, making findings
+    // informational-only per scope exclusion. The cross-check catches this
+    // class of stale-scope failure before findings land in BOUNTY_LEDGER.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_deprecated_target_detects_archived_readme() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Old Project\n\nThis project has been archived. Please use the new fork.\n",
+        )
+        .unwrap();
+        let verdict = is_deprecated_target(dir.path());
+        assert!(
+            verdict.is_some(),
+            "archived README must register as deprecated"
+        );
+        let (filename, keyword) = verdict.unwrap();
+        assert_eq!(filename, "README.md");
+        assert_eq!(keyword, "archived");
+    }
+
+    #[test]
+    fn is_deprecated_target_returns_none_for_active_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Active Project\n\nWelcome to Foo, an actively-developed open source library with first-class support.\n",
+        )
+        .unwrap();
+        assert!(
+            is_deprecated_target(dir.path()).is_none(),
+            "active project README must NOT register as deprecated"
+        );
+    }
+
+    #[test]
+    fn is_deprecated_target_recognises_mattermost_boards_community_pattern() {
+        // Mattermost-plugin-boards (Focalboard) README excerpt simulation
+        // for Sprint 138 deprecation detection.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Mattermost Boards\n\nNote: as of late 2023 this plugin has transitioned to community maintenance and is no longer officially supported by Mattermost staff.\n",
+        )
+        .unwrap();
+        let verdict = is_deprecated_target(dir.path());
+        assert!(
+            verdict.is_some(),
+            "community-maintained pattern must register as deprecated"
+        );
+    }
+
+    #[test]
+    fn is_deprecated_target_falls_back_to_security_md() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Active project, no deprecation language here\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("SECURITY.md"),
+            b"This repository is deprecated. Please report security issues to the upstream fork.\n",
+        )
+        .unwrap();
+        let verdict = is_deprecated_target(dir.path());
+        assert!(
+            verdict.is_some(),
+            "SECURITY.md must be scanned as a fallback"
+        );
+        let (filename, _) = verdict.unwrap();
+        assert_eq!(filename, "SECURITY.md");
+    }
+
+    #[test]
+    fn apply_deprecation_demotion_marks_findings_informational() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Deprecated Project\n\nThis project is deprecated.\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:react_xss_dangerous_html".to_string(),
+            severity: Some("Critical".to_string()),
+            remediation: Some("Sanitize input with DOMPurify".to_string()),
+            ..Default::default()
+        }];
+        apply_deprecation_demotion(dir.path(), &mut findings);
+        assert_eq!(findings[0].severity.as_deref(), Some("Informational"));
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("deprecated_target"),
+            "remediation must annotate deprecation: {remediation}"
+        );
+        assert!(
+            remediation.contains("informational_only_per_scope_exclusion"),
+            "remediation must contain scope-exclusion reason: {remediation}"
+        );
+    }
+
+    #[test]
+    fn apply_deprecation_demotion_is_noop_on_fresh_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            b"# Active Project\n\nFirst-party supported library.\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:react_xss_dangerous_html".to_string(),
+            severity: Some("Critical".to_string()),
+            remediation: Some("Sanitize input".to_string()),
+            ..Default::default()
+        }];
+        apply_deprecation_demotion(dir.path(), &mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("Critical"),
+            "fresh target must not be demoted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprint 142 — Concrete-typed Unmarshal demotion. Sprint 141 demoted the
+    // chainlink protobuf_any CANDIDATE because the cited Unmarshal target was
+    // a concrete typed message (sdkpb.CapabilityRequest), not anypb.Any. This
+    // post-filter catches the class structurally.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concrete_typed_unmarshal_demotes_when_no_anypb_nearby() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let go_path = dir.path().join("handler.go");
+        std::fs::write(
+            &go_path,
+            b"package handler\n\nimport sdkpb \"example.com/sdkpb\"\n\nfunc Handle(payloadBytes []byte) error {\n    var sdkReq sdkpb.CapabilityRequest\n    if err := proto.Unmarshal(payloadBytes, &sdkReq); err != nil {\n        return err\n    }\n    return nil\n}\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:protobuf_any_unguarded_decode".to_string(),
+            file: Some("handler.go".to_string()),
+            line: Some(7),
+            severity: Some("High".to_string()),
+            remediation: Some("Validate Any.type_url".to_string()),
+            ..Default::default()
+        }];
+        apply_concrete_typed_unmarshal_demotion(dir.path(), &mut findings);
+        assert_eq!(findings[0].severity.as_deref(), Some("Informational"));
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("concrete_typed_unmarshal"),
+            "remediation must annotate: {remediation}"
+        );
+    }
+
+    #[test]
+    fn concrete_typed_unmarshal_preserves_when_anypb_present_in_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let go_path = dir.path().join("genuine_any.go");
+        std::fs::write(
+            &go_path,
+            b"package handler\n\nimport \"google.golang.org/protobuf/types/known/anypb\"\n\nfunc Handle(payloadBytes []byte) error {\n    var msg anypb.Any\n    if err := proto.Unmarshal(payloadBytes, &msg); err != nil {\n        return err\n    }\n    return nil\n}\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:protobuf_any_unguarded_decode".to_string(),
+            file: Some("genuine_any.go".to_string()),
+            line: Some(7),
+            severity: Some("High".to_string()),
+            remediation: Some("Validate Any.type_url".to_string()),
+            ..Default::default()
+        }];
+        apply_concrete_typed_unmarshal_demotion(dir.path(), &mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("High"),
+            "anypb.Any presence must preserve upstream finding"
+        );
+    }
+
+    #[test]
+    fn concrete_typed_unmarshal_unaffects_non_protobuf_findings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("foo.go"),
+            b"package handler\n\nfunc Handle() {}\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:sql_injection".to_string(),
+            file: Some("foo.go".to_string()),
+            line: Some(3),
+            severity: Some("High".to_string()),
+            remediation: Some("Parameterize query".to_string()),
+            ..Default::default()
+        }];
+        apply_concrete_typed_unmarshal_demotion(dir.path(), &mut findings);
+        assert_eq!(
+            findings[0].severity.as_deref(),
+            Some("High"),
+            "non-protobuf finding must be unaffected"
+        );
+    }
+
+    #[test]
+    fn concrete_typed_unmarshal_safe_on_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:protobuf_any_unguarded_decode".to_string(),
+            file: Some("nonexistent.go".to_string()),
+            line: Some(1),
+            severity: Some("High".to_string()),
+            ..Default::default()
+        }];
+        // Must not panic, must not modify the finding.
+        apply_concrete_typed_unmarshal_demotion(dir.path(), &mut findings);
+        assert_eq!(findings[0].severity.as_deref(), Some("High"));
     }
 }

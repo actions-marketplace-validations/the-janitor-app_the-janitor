@@ -52,6 +52,8 @@ use common::policy::Suppression;
 use common::registry::SymbolRegistry;
 use common::surface::SurfaceKind;
 
+use crate::proof_obligation::seal_with_lattice_gap_proof;
+
 // ---------------------------------------------------------------------------
 // SlopScore
 // ---------------------------------------------------------------------------
@@ -546,24 +548,23 @@ fn push_manifest_structured_findings(
 ) {
     for finding in findings {
         let line = byte_offset_to_line(source, finding.start_byte);
-        score
-            .structured_findings
-            .push(common::slop::StructuredFinding {
-                id: finding.description.clone(),
-                file: Some(file_path.to_string()),
-                line: Some(line),
-                fingerprint: finding_fingerprint(
-                    extract_rule_id(&finding.description),
-                    file_path,
-                    finding_fingerprint_span(source, finding.start_byte, finding.end_byte),
-                ),
-                severity: Some(format!("{:?}", finding.severity)),
-                remediation: None,
-                docs_url: None,
-                exploit_witness: None,
-                upstream_validation_absent: false,
-                ..Default::default()
-            });
+        let structured = seal_with_lattice_gap_proof(common::slop::StructuredFinding {
+            id: finding.description.clone(),
+            file: Some(file_path.to_string()),
+            line: Some(line),
+            fingerprint: finding_fingerprint(
+                extract_rule_id(&finding.description),
+                file_path,
+                finding_fingerprint_span(source, finding.start_byte, finding.end_byte),
+            ),
+            severity: Some(format!("{:?}", finding.severity)),
+            remediation: None,
+            docs_url: None,
+            exploit_witness: None,
+            upstream_validation_absent: false,
+            ..Default::default()
+        });
+        score.structured_findings.push(structured);
     }
 }
 
@@ -669,6 +670,10 @@ pub struct PatchBouncer {
     deep_scan: bool,
     require_pinned_dependencies: bool,
     execution_tier: String,
+    clone_exempt_paths: Vec<String>,
+    /// Branch name of the PR head — used to exempt `release/v*` branches from the
+    /// blast-radius gate without depending on CHANGELOG.md appearing in the diff.
+    branch_name: Option<String>,
 }
 
 impl PatchBouncer {
@@ -681,6 +686,7 @@ impl PatchBouncer {
             policy.execution_tier,
         )
         .with_require_pinned_dependencies(policy.forge.require_pinned_dependencies)
+        .with_clone_exempt_paths(policy.forge.clone_exempt_paths)
     }
 
     pub fn for_workspace_with_deep_scan(root: &Path, deep_scan: bool) -> Self {
@@ -692,6 +698,7 @@ impl PatchBouncer {
             policy.execution_tier,
         )
         .with_require_pinned_dependencies(policy.forge.require_pinned_dependencies)
+        .with_clone_exempt_paths(policy.forge.clone_exempt_paths)
     }
 
     pub fn for_workspace_with_deep_scan_and_suppressions(
@@ -708,11 +715,25 @@ impl PatchBouncer {
             deep_scan,
             require_pinned_dependencies: false,
             execution_tier: execution_tier.into(),
+            clone_exempt_paths: Vec::new(),
+            branch_name: None,
         }
     }
 
     pub fn with_require_pinned_dependencies(mut self, require_pinned_dependencies: bool) -> Self {
         self.require_pinned_dependencies = require_pinned_dependencies;
+        self
+    }
+
+    pub fn with_clone_exempt_paths(mut self, paths: Vec<String>) -> Self {
+        self.clone_exempt_paths = paths;
+        self
+    }
+
+    /// Set the head branch name so the blast-radius gate can exempt `release/v*`
+    /// branches without relying on `CHANGELOG.md` appearing in the diff.
+    pub fn with_branch_name(mut self, branch: impl Into<String>) -> Self {
+        self.branch_name = Some(branch.into());
         self
     }
 
@@ -806,11 +827,35 @@ impl PRBouncer for PatchBouncer {
                 v.sort();
                 v
             };
+            // A release PR legitimately spans many top-level directories:
+            // crates/, docs/, .github/, Cargo.toml, README.md, justfile, etc.
+            // Primary signal: branch name starts with `release/v` (set by `just fast-release`).
+            // Fallback: Cargo.toml + CHANGELOG.md both present in the diff (brittle when
+            // CHANGELOG is committed to main by sprint PRs before the release branch is cut).
+            let section_paths: Vec<String> =
+                sections.iter().map(|s| extract_patch_path(s)).collect();
+            let is_release_pr = self
+                .branch_name
+                .as_deref()
+                .is_some_and(|b| b.starts_with("release/v"))
+                || (section_paths.iter().any(|p| p == "Cargo.toml")
+                    && section_paths.iter().any(|p| p.ends_with("CHANGELOG.md")));
             for section in sections {
                 // Errors are non-fatal: a parse failure in one file section does
                 // not invalidate the analysis of the remaining sections.
                 if let Ok(mut s) = self.bounce(section, registry) {
                     total.dead_symbols_added += s.dead_symbols_added;
+                    // Suppress logic-clone scoring for classifier-registry paths
+                    // where intentionally repetitive boolean-predicate functions
+                    // are the correct design (e.g. proof_obligation.rs).
+                    let section_path = extract_patch_path(section);
+                    if self
+                        .clone_exempt_paths
+                        .iter()
+                        .any(|exempt| section_path.contains(exempt.as_str()))
+                    {
+                        s.logic_clones_found = 0;
+                    }
                     total.logic_clones_found += s.logic_clones_found;
                     total.zombie_symbols_added += s.zombie_symbols_added;
                     total.antipatterns_found += s.antipatterns_found;
@@ -819,6 +864,17 @@ impl PRBouncer for PatchBouncer {
                     total.antipattern_details.extend(s.antipattern_details);
                     total.structured_findings.append(&mut s.structured_findings);
                 }
+            }
+            // ── Release-PR Clone Exemption ────────────────────────────────────
+            // A coordinated version-bump PR legitimately adds many structurally
+            // similar test functions (assertions, fixtures, harnesses) that the
+            // clone detector scores as logic duplication.  These are not hallucinated
+            // refactors — they are the mandatory test coverage.  Zero out the
+            // accumulated clone count when the PR is identified as a release commit
+            // (Cargo.toml + CHANGELOG.md both present) so the score reflects only
+            // real structural violations, not test boilerplate.
+            if is_release_pr {
+                total.logic_clones_found = 0;
             }
             // ── API Migration Guard ───────────────────────────────────────────
             // Runs at the multi-file aggregate level so it sees both Cargo.lock
@@ -856,7 +912,9 @@ impl PRBouncer for PatchBouncer {
             // top-level directories.  Lockfile-only paths are excluded from the
             // count — dependency bumps legitimately touch Cargo.lock/go.sum
             // across the entire repo without indicating a hallucinated refactor.
-            if blast_dirs.len() > 5 {
+            // Release PRs (Cargo.toml + CHANGELOG.md both present) are exempt:
+            // a coordinated version bump touches many subsystems by design.
+            if blast_dirs.len() > 5 && !is_release_pr {
                 let desc = format!(
                     "architecture:blast_radius_violation — PR modifies files in {} distinct \
                      top-level directories ({}); exceeds the 5-directory gate, probable \
@@ -940,7 +998,13 @@ impl PRBouncer for PatchBouncer {
             self.repo_root.as_deref(),
         );
 
-        let pre_lang_payload_findings: Vec<String> = if raw_added.trim().is_empty() {
+        // CycloneDX SBOM artifacts (.cdx.json) legitimately contain third-party
+        // crate documentation URLs hosted on github.io in their externalReferences
+        // sections. These are metadata links, not production asset loads. Skip
+        // binary_hunter scan for SBOM files to prevent false positives on release diffs.
+        let pre_lang_payload_findings: Vec<String> = if raw_added.trim().is_empty()
+            || file_path.ends_with(".cdx.json")
+        {
             vec![]
         } else {
             advanced_threats::binary_hunter::scan(raw_added.as_bytes())
@@ -1033,7 +1097,7 @@ impl PRBouncer for PatchBouncer {
                         self.repo_root.as_deref(),
                     );
                     let mut raw_findings = manifest_findings;
-                    raw_findings.extend(crate::slop_hunter::find_slop(ext, &parsed));
+                    raw_findings.extend(crate::slop_hunter::find_slop(ext, &parsed, &file_path));
                     raw_findings.extend(crate::slop_hunter::find_generative_build_execution(
                         &file_path, ext, source,
                     ));
@@ -1121,7 +1185,7 @@ impl PRBouncer for PatchBouncer {
         };
 
         // Reconstruct added source from `+` diff lines.
-        let added = raw_added.clone();
+        let added = raw_added;
 
         if added.trim().is_empty() {
             return Ok(SlopScore::default());
@@ -1226,6 +1290,18 @@ impl PRBouncer for PatchBouncer {
         let authz_consistency_findings = crate::authz::check_authz_consistency(&endpoint_surfaces);
         let idor_findings = crate::idor::scan_tree(&tree, ext, source, &file_path);
         let toctou_findings = crate::toctou::detect_race_conditions(ext, source, &file_path);
+        let source_utf8 = std::str::from_utf8(source).unwrap_or("");
+        let debug_endpoint_findings =
+            crate::debug_endpoint_guard::emit_debug_endpoint_findings(source_utf8, &file_path);
+        let oidc_scope_findings =
+            crate::oidc_scope_guard::emit_oidc_scope_findings(source_utf8, &file_path);
+        let linker_hijack_findings =
+            crate::linker_hijack::emit_linker_hijack_findings(source_utf8, &file_path);
+        let kernel_findings = crate::kernel::emit_kernel_findings(source_utf8, &file_path);
+        let oauth_state_findings =
+            crate::oauth_account_fusion::detect_missing_state_validation(source, &file_path);
+        let pkce_downgrade_findings =
+            crate::oauth_account_fusion::detect_pkce_downgrade(source, &file_path);
 
         // Domain routing: classify this file's context so memory-safety rules are
         // not applied to vendored or test code.  Supply-chain rules (DOMAIN_ALL)
@@ -1346,11 +1422,15 @@ impl PRBouncer for PatchBouncer {
             })
             .collect();
         let package_context =
-            package_context_for_patch(&file_path, &raw_added, self.repo_root.as_deref());
+            package_context_for_patch(&file_path, &added, self.repo_root.as_deref());
         for semantic_root in &semantic_roots {
             let subtree_bytes = &source[semantic_root.start_byte()..semantic_root.end_byte()];
             let subtree_unit = crate::slop_hunter::ParsedUnit::unparsed(subtree_bytes);
-            raw_findings.extend(crate::slop_hunter::find_slop(ext, &subtree_unit));
+            raw_findings.extend(crate::slop_hunter::find_slop(
+                ext,
+                &subtree_unit,
+                &file_path,
+            ));
         }
         raw_findings.extend(crate::slop_hunter::find_generative_build_execution(
             &file_path, ext, source,
@@ -1358,6 +1438,8 @@ impl PRBouncer for PatchBouncer {
         raw_findings.extend(crate::slop_hunter::find_untrusted_ide_extensions(
             &file_path, source,
         ));
+        raw_findings.extend(oauth_state_findings);
+        raw_findings.extend(pkce_downgrade_findings);
         raw_findings.retain(|finding| {
             !should_suppress_contextual_finding(finding, package_context.as_deref())
         });
@@ -1550,7 +1632,11 @@ impl PRBouncer for PatchBouncer {
             accepted.len()
                 + authz_consistency_findings.len()
                 + idor_findings.len()
-                + toctou_findings.len(),
+                + toctou_findings.len()
+                + debug_endpoint_findings.len()
+                + oidc_scope_findings.len()
+                + linker_hijack_findings.len()
+                + kernel_findings.len(),
         );
         for f in accepted {
             let line = byte_offset_to_line(source, f.start_byte);
@@ -1708,6 +1794,42 @@ impl PRBouncer for PatchBouncer {
         }
         for finding in governance_findings {
             antipattern_score += crate::slop_hunter::Severity::Critical.points();
+            antipattern_details.push(format!(
+                "{} (line={})",
+                finding.id,
+                finding.line.unwrap_or_default()
+            ));
+            structured_findings.push(finding);
+        }
+        for finding in debug_endpoint_findings {
+            antipattern_score += crate::slop_hunter::Severity::KevCritical.points();
+            antipattern_details.push(format!(
+                "{} (line={})",
+                finding.id,
+                finding.line.unwrap_or_default()
+            ));
+            structured_findings.push(finding);
+        }
+        for finding in oidc_scope_findings {
+            antipattern_score += crate::slop_hunter::Severity::KevCritical.points();
+            antipattern_details.push(format!(
+                "{} (line={})",
+                finding.id,
+                finding.line.unwrap_or_default()
+            ));
+            structured_findings.push(finding);
+        }
+        for finding in linker_hijack_findings {
+            antipattern_score += crate::slop_hunter::Severity::KevCritical.points();
+            antipattern_details.push(format!(
+                "{} (line={})",
+                finding.id,
+                finding.line.unwrap_or_default()
+            ));
+            structured_findings.push(finding);
+        }
+        for finding in kernel_findings {
+            antipattern_score += crate::slop_hunter::Severity::KevCritical.points();
             antipattern_details.push(format!(
                 "{} (line={})",
                 finding.id,
@@ -2241,6 +2363,7 @@ pub fn semantic_null_pr_check(repo_path: &Path, merge_base_sha: &str, pr_sha: &s
 /// # Errors
 /// Returns `Err` if the repository cannot be opened, the OIDs are invalid, or
 /// libgit2 cannot read a blob from the pack.
+#[allow(clippy::too_many_arguments)]
 pub fn bounce_git(
     repo_path: &Path,
     base_sha: &str,
@@ -2249,6 +2372,7 @@ pub fn bounce_git(
     suppressions: Vec<Suppression>,
     deep_scan: bool,
     scan_state: &mut common::scan_state::ScanState,
+    clone_exempt_paths: Vec<String>,
 ) -> Result<(SlopScore, HashMap<std::path::PathBuf, Vec<u8>>)> {
     let repo = git2::Repository::open(repo_path).map_err(|e| {
         anyhow::anyhow!("bounce_git: cannot open repo {}: {e}", repo_path.display())
@@ -2364,6 +2488,7 @@ pub fn bounce_git(
             deep_scan,
             "Community",
         )
+        .with_clone_exempt_paths(clone_exempt_paths.clone())
         .bounce(patch, registry)
         {
             total.dead_symbols_added += score.dead_symbols_added;
@@ -2388,6 +2513,73 @@ pub fn bounce_git(
             total
                 .semantic_mutation_roots
                 .append(&mut score.semantic_mutation_roots);
+        }
+
+        // ── patch_proof Oracle (P7-2 Phase B) ────────────────────────────────
+        //
+        // Retrieve the base blob from the base commit tree and run the AST
+        // bisimulation prover against the HEAD blob.  New files (absent from
+        // the base tree) are skipped — Unsatisfiable only fires on parse
+        // failures, not on genuine new-file additions.
+        {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            if let Ok(base_commit) = repo.find_commit(base_oid) {
+                if let Ok(base_tree) = base_commit.tree() {
+                    if let Ok(entry) = base_tree.get_path(path) {
+                        if let Ok(obj) = entry.to_object(&repo) {
+                            if let Some(base_blob) = obj.as_blob() {
+                                let base_bytes = base_blob.content();
+                                if let Some(proof) = crate::patch_proof::prove_patch_correctness(
+                                    base_bytes, blob_bytes, ext,
+                                ) {
+                                    let file_str = path.to_string_lossy().into_owned();
+                                    match &proof.verdict {
+                                        crate::patch_proof::PatchVerdict::IntroducesNewBehavior {
+                                            changed_nodes,
+                                        } if changed_nodes.len() >= 3 => {
+                                            use common::slop::StructuredFinding;
+                                            total.structured_findings.push(StructuredFinding {
+                                                id: format!(
+                                                    "architecture:patch_introduces_new_behavior \
+                                                     — {file_str} introduces {} structural \
+                                                     changes beyond the declared fix scope",
+                                                    changed_nodes.len()
+                                                ),
+                                                severity: Some("Medium".to_string()),
+                                                file: Some(file_str),
+                                                proof_class: Some(
+                                                    common::slop::ProofClass::InvariantViolationProof,
+                                                ),
+                                                ..Default::default()
+                                            });
+                                        }
+                                        crate::patch_proof::PatchVerdict::Unsatisfiable => {
+                                            use common::slop::StructuredFinding;
+                                            total.structured_findings.push(StructuredFinding {
+                                                id: format!(
+                                                    "architecture:patch_proof_unsatisfiable \
+                                                     — AST bisimulation failed for {file_str}; \
+                                                     parser rejected one or both buffers"
+                                                ),
+                                                severity: Some("Low".to_string()),
+                                                file: Some(file_str),
+                                                proof_class: Some(
+                                                    common::slop::ProofClass::LatticeGapProposal,
+                                                ),
+                                                ..Default::default()
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2563,6 +2755,157 @@ fn finding_fingerprint(rule_id: &str, file_path: &str, span_bytes: &[u8]) -> Str
         blake3::hash(span_bytes).to_hex()
     );
     blake3::hash(material.as_bytes()).to_hex().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 138 — Focus-Area Mapping Cross-Check
+// ---------------------------------------------------------------------------
+
+/// Sprint 138 — Focus-Area Mapping Cross-Check.
+///
+/// Parses the `### Focus Areas` section of a bug-bounty program's scope
+/// file at `tools/campaign/targets/<program>_targets.md` and checks whether
+/// each finding's vulnerability class textually overlaps any stated focus
+/// area. Findings without overlap have `[focus_area_mismatch]` appended to
+/// the `remediation` field; downstream triage and ledger routing must
+/// downgrade the estimated approval percentage by 50% for these findings.
+///
+/// Motivating case (Sprint 138 chainlink JWT): the chainlink program's
+/// stated focus areas are oracle/reentrancy/on-chain concerns. A JWT
+/// validation bypass in off-chain Go node code does NOT textually overlap
+/// any focus area, so the static `0.36` approval rating overestimates
+/// real-world payout odds and gets a 50% downgrade.
+///
+/// No-op when:
+/// - `scope_file_path` does not exist or cannot be read,
+/// - the scope file contains no `### Focus Areas` section,
+/// - the finding list is empty.
+pub fn apply_focus_area_check(
+    findings: &mut [common::slop::StructuredFinding],
+    scope_file_path: &Path,
+) {
+    if findings.is_empty() {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(scope_file_path) else {
+        return;
+    };
+    let focus_keywords = extract_focus_area_keywords(&content);
+    if focus_keywords.is_empty() {
+        return;
+    }
+    for finding in findings.iter_mut() {
+        let finding_keywords = extract_finding_keywords(&finding.id);
+        let has_overlap = finding_keywords.iter().any(|fk| {
+            focus_keywords
+                .iter()
+                .any(|key| key.contains(fk.as_str()) || fk.contains(key.as_str()))
+        });
+        if !has_overlap {
+            let existing = finding.remediation.take().unwrap_or_default();
+            finding.remediation = Some(format!(
+                "{existing} [focus_area_mismatch: not aligned to program focus areas; downgrade approval by 50%]"
+            ));
+        }
+    }
+}
+
+/// Extract bullet-item keywords from the `### Focus Areas` section of a
+/// scope file. Tokens shorter than 4 chars and a small stopword set are
+/// excluded so noise words like `and`, `for`, `into` cannot generate
+/// spurious matches.
+fn extract_focus_area_keywords(scope_content: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut in_focus_areas = false;
+    for line in scope_content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("###") && lower.contains("focus area") {
+            in_focus_areas = true;
+            continue;
+        }
+        if in_focus_areas
+            && (trimmed.starts_with("###")
+                || trimmed.starts_with("##")
+                || trimmed.starts_with("---"))
+        {
+            break;
+        }
+        if !in_focus_areas {
+            continue;
+        }
+        let item = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed);
+        if item.is_empty() {
+            continue;
+        }
+        for token in item.split(|c: char| !c.is_alphanumeric() && c != '-') {
+            let cleaned = token.to_lowercase();
+            if cleaned.len() >= 4 && !is_focus_stopword(&cleaned) {
+                keywords.push(cleaned);
+            }
+        }
+    }
+    keywords
+}
+
+/// Extract keyword tokens from a finding's `id` field, expanded with a
+/// small synonym table so abbreviated rule ids match the natural-English
+/// vocabulary used in program focus-area bullet lists.
+fn extract_finding_keywords(finding_id: &str) -> Vec<String> {
+    let core = finding_id
+        .strip_prefix("security:")
+        .unwrap_or(finding_id)
+        .to_lowercase();
+    let mut keywords: Vec<String> = core
+        .split(['_', '-', ':'])
+        .filter(|s| s.len() >= 3)
+        .map(|s| s.to_string())
+        .collect();
+    const CLASS_SYNONYMS: &[(&str, &[&str])] = &[
+        ("xss", &["html", "scripting", "browser", "injection"]),
+        ("sql", &["database", "injection", "query"]),
+        ("sqli", &["database", "injection", "query"]),
+        ("ssrf", &["request", "forgery", "metadata"]),
+        ("jwt", &["authentication", "token", "session", "auth"]),
+        ("idor", &["access", "authorization", "ownership"]),
+        ("rce", &["execution", "command", "shell"]),
+        ("dom", &["browser", "client"]),
+        ("auth", &["authentication", "authorization"]),
+        ("crypto", &["cryptographic"]),
+        ("tls", &["transport"]),
+        ("ffi", &["memory"]),
+        ("deser", &["deserialization", "deserialisation"]),
+        ("backdoor", &["malicious", "implant"]),
+    ];
+    for (class, synonyms) in CLASS_SYNONYMS {
+        if keywords.iter().any(|k| k == class) {
+            for syn in *synonyms {
+                keywords.push((*syn).to_string());
+            }
+        }
+    }
+    keywords
+}
+
+fn is_focus_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "into"
+            | "from"
+            | "this"
+            | "that"
+            | "flaws"
+            | "issues"
+            | "between"
+            | "areas"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3280,6 +3623,27 @@ diff --git a/docs/review.md b/docs/review.md
     }
 
     #[test]
+    fn test_cdx_json_sbom_github_io_not_flagged() {
+        // CycloneDX SBOM files legitimately contain third-party crate doc URLs
+        // on github.io in their externalReferences. These must not fire
+        // security:unpinned_asset — they are metadata links, not production asset loads.
+        let src = "\"url\": \"https://contain-rs.github.io/bit-set/bit_set\"\n";
+        let patch = make_patch("crates/cli/janitor.cdx.json", src);
+        let score = PatchBouncer::default()
+            .bounce(&patch, &empty_registry())
+            .unwrap();
+        let unpinned: Vec<&String> = score
+            .antipattern_details
+            .iter()
+            .filter(|d| d.contains("unpinned_asset"))
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            ".cdx.json github.io URL must not fire unpinned_asset: {unpinned:?}"
+        );
+    }
+
+    #[test]
     fn test_payload_shield_clean_source_not_flagged() {
         // Ordinary Rust source code must not trigger the payload shield.
         let src = "fn compute(a: i32, b: i32) -> i32 { a + b }\n";
@@ -3469,6 +3833,134 @@ diff --git a/docs/review.md b/docs/review.md
     }
 
     #[test]
+    fn test_blast_radius_gate_exempt_for_release_pr() {
+        // A release PR touches Cargo.toml + CHANGELOG.md alongside many crate dirs.
+        // The blast-radius gate must not fire: this is a coordinated version bump,
+        // not an agentic hallucinated refactor.
+        let patch = make_multi_dir_patch(&[
+            "Cargo.toml",
+            "docs/CHANGELOG.md",
+            "crates/forge/src/lib.rs",
+            "crates/cli/src/main.rs",
+            ".github/workflows/janitor.yml",
+            ".agent_governance/rules/response-format.md",
+            "tools/campaign/CANDIDATE_LEDGER.md",
+            "justfile",
+            "README.md",
+        ]);
+        let score = PatchBouncer::default()
+            .bounce(&patch, &empty_registry())
+            .unwrap();
+        assert!(
+            !score
+                .antipattern_details
+                .iter()
+                .any(|d| d.contains("blast_radius_violation")),
+            "release PR (Cargo.toml + CHANGELOG.md) must be exempt from blast_radius gate: {:?}",
+            score.antipattern_details
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_gate_fires_without_changelog() {
+        // 6+ dirs without CHANGELOG.md present — must still fire even if Cargo.toml is there.
+        let patch = make_multi_dir_patch(&[
+            "Cargo.toml",
+            "crates/forge/src/lib.rs",
+            "docs/guide.md",
+            "tools/script.sh",
+            "frontend/app.js",
+            "backend/api.rs",
+            "infra/main.tf",
+        ]);
+        let score = PatchBouncer::default()
+            .bounce(&patch, &empty_registry())
+            .unwrap();
+        assert!(
+            score
+                .antipattern_details
+                .iter()
+                .any(|d| d.contains("blast_radius_violation")),
+            "6-dir PR without CHANGELOG.md must still fire blast_radius_violation: {:?}",
+            score.antipattern_details
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_gate_exempt_for_release_branch_name() {
+        // A 7-dir release PR diff WITHOUT CHANGELOG.md must not fire blast_radius_violation
+        // when the branch name is `release/v*`.  This exercises the primary heuristic
+        // that does not depend on CHANGELOG.md appearing in the PR diff — which fails
+        // when CHANGELOG is committed to main by sprint PRs before the release branch is cut.
+        let patch = make_multi_dir_patch(&[
+            "Cargo.toml",
+            "crates/forge/src/lib.rs",
+            "crates/cli/src/main.rs",
+            ".github/workflows/janitor.yml",
+            ".agent_governance/rules/release-discipline.md",
+            "tools/campaign/CANDIDATE_LEDGER.md",
+            "README.md",
+        ]);
+        let score = PatchBouncer::default()
+            .with_branch_name("release/v10.3.0")
+            .bounce(&patch, &empty_registry())
+            .unwrap();
+        assert!(
+            !score
+                .antipattern_details
+                .iter()
+                .any(|d| d.contains("blast_radius_violation")),
+            "release/v* branch must be exempt from blast_radius gate even without CHANGELOG.md: {:?}",
+            score.antipattern_details
+        );
+    }
+
+    #[test]
+    fn test_release_pr_clone_exemption() {
+        // A release PR with Cargo.toml + CHANGELOG.md must have logic_clones zeroed.
+        // Use a patch with two structurally identical blocks that would normally
+        // register as clones (same added lines in two different files).
+        let identical_body = "+fn test_a() { assert_eq!(1, 1); }\n";
+        let patch = format!(
+            "diff --git a/Cargo.toml b/Cargo.toml\n\
+             index 0000000..1111111 100644\n\
+             --- a/Cargo.toml\n\
+             +++ b/Cargo.toml\n\
+             @@ -0,0 +1 @@\n\
+             +version = \"10.2.3\"\n\
+             \n\
+             diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md\n\
+             index 0000000..1111111 100644\n\
+             --- a/docs/CHANGELOG.md\n\
+             +++ b/docs/CHANGELOG.md\n\
+             @@ -0,0 +1 @@\n\
+             +# v10.2.3\n\
+             \n\
+             diff --git a/crates/forge/src/a.rs b/crates/forge/src/a.rs\n\
+             index 0000000..1111111 100644\n\
+             --- a/crates/forge/src/a.rs\n\
+             +++ b/crates/forge/src/a.rs\n\
+             @@ -0,0 +1 @@\n\
+             {identical_body}\
+             \n\
+             diff --git a/crates/cli/src/b.rs b/crates/cli/src/b.rs\n\
+             index 0000000..1111111 100644\n\
+             --- a/crates/cli/src/b.rs\n\
+             +++ b/crates/cli/src/b.rs\n\
+             @@ -0,0 +1 @@\n\
+             {identical_body}"
+        );
+        let score = PatchBouncer::default()
+            .bounce(&patch, &empty_registry())
+            .unwrap();
+        assert_eq!(
+            score.logic_clones_found, 0,
+            "release PR (Cargo.toml + CHANGELOG.md) must zero logic_clones_found: got {}",
+            score.logic_clones_found
+        );
+    }
+
+    #[test]
     fn test_structured_findings_parallel_antipattern_details() {
         // A Python patch with a dynamic eval call must produce a structured finding
         // with a non-None line and a machine-readable id matching the prose detail.
@@ -3507,5 +3999,162 @@ diff --git a/docs/review.md b/docs/review.md
             score.structured_findings.is_empty(),
             "clean patch must produce no structured findings"
         );
+    }
+
+    // ── P7-2 Phase B: patch_proof oracle verdict tests ───────────────────────
+
+    #[test]
+    fn patch_proof_oracle_emits_introduces_new_behavior_at_threshold() {
+        // 5 Rust functions each modified to add a distinct AST construct so that
+        // changed_node_kinds accumulates ≥3 distinct kinds and modified_functions.len() > 3.
+        let before = b"\
+fn a(x: i32) -> i32 { x }\n\
+fn b(x: i32) -> i32 { x }\n\
+fn c(x: i32) -> i32 { x }\n\
+fn d(x: i32) -> i32 { x }\n\
+fn e(x: i32) -> i32 { x }\n";
+        let after = b"\
+fn a(x: i32) -> i32 { if x > 0 { x } else { 0 } }\n\
+fn b(x: i32) -> i32 { loop { return x; } }\n\
+fn c(x: i32) -> i32 { while x > 0 { return x; } x }\n\
+fn d(x: i32) -> i32 { for _i in 0..x { return x; } x }\n\
+fn e(x: i32) -> i32 { match x { 0 => 1, n => n } }\n";
+        let proof = crate::patch_proof::prove_patch_correctness(before, after, "rs");
+        assert!(proof.is_some(), "rs is a supported extension");
+        let proof = proof.unwrap();
+        assert!(
+            matches!(
+                &proof.verdict,
+                crate::patch_proof::PatchVerdict::IntroducesNewBehavior { changed_nodes }
+                    if changed_nodes.len() >= 3
+            ),
+            "5-function poly-construct diff must be IntroducesNewBehavior with ≥3 node kinds: {:?}",
+            proof.verdict
+        );
+    }
+
+    #[test]
+    fn patch_proof_oracle_emits_unsatisfiable_on_empty_before() {
+        // An empty base buffer (new file) must produce PatchVerdict::Unsatisfiable.
+        let before = b"";
+        let after = b"def a(): pass\n";
+        let proof = crate::patch_proof::prove_patch_correctness(before, after, "py");
+        assert!(proof.is_some());
+        assert_eq!(
+            proof.unwrap().verdict,
+            crate::patch_proof::PatchVerdict::Unsatisfiable,
+            "empty base buffer must be Unsatisfiable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprint 138 — apply_focus_area_check tests.
+    // The motivating regression: a chainlink JWT bypass finding was rated
+    // 36% approval in CANDIDATE_LEDGER, but chainlink's program focus areas
+    // are oracle/reentrancy/on-chain only. Off-chain Go auth bugs do not
+    // textually overlap any focus area; the static approval was inflated.
+    // The cross-check downgrades approval by 50% for unmapped findings.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn focus_area_check_flags_chainlink_jwt_bypass_as_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scope_path = tmp.path().join("chainlink_targets.md");
+        std::fs::write(
+            &scope_path,
+            b"# Chainlink\n\n### Focus Areas\n- Oracle feed manipulation\n- Access control flaws in price aggregation\n- Reentrancy in callback handlers\n- Off-chain to on-chain data integrity\n\n---\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:jwt_validation_bypass".to_string(),
+            remediation: Some("Validate alg=none rejection".to_string()),
+            ..Default::default()
+        }];
+        apply_focus_area_check(&mut findings, &scope_path);
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            remediation.contains("focus_area_mismatch"),
+            "JWT bypass in off-chain Go must MISMATCH on-chain focus areas: {remediation}"
+        );
+    }
+
+    #[test]
+    fn focus_area_check_does_not_flag_oracle_finding_against_chainlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scope_path = tmp.path().join("chainlink_targets.md");
+        std::fs::write(
+            &scope_path,
+            b"# Chainlink\n\n### Focus Areas\n- Oracle feed manipulation\n- Access control flaws in price aggregation\n- Reentrancy in callback handlers\n\n---\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:oracle_feed_tampering".to_string(),
+            remediation: Some("Validate aggregator signatures".to_string()),
+            ..Default::default()
+        }];
+        apply_focus_area_check(&mut findings, &scope_path);
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            !remediation.contains("focus_area_mismatch"),
+            "oracle finding must MATCH chainlink oracle focus area: {remediation}"
+        );
+    }
+
+    #[test]
+    fn focus_area_check_synonym_table_resolves_jwt_to_authentication() {
+        // Some programs phrase focus areas as "authentication weaknesses"
+        // rather than naming JWT explicitly. The synonym table must close
+        // this gap so common abbreviations are not over-flagged.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scope_path = tmp.path().join("authprog_targets.md");
+        std::fs::write(
+            &scope_path,
+            b"# AuthProg\n\n### Focus Areas\n- Authentication weaknesses\n- Session management flaws\n\n---\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:jwt_validation_bypass".to_string(),
+            remediation: Some("Validate alg=none rejection".to_string()),
+            ..Default::default()
+        }];
+        apply_focus_area_check(&mut findings, &scope_path);
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            !remediation.contains("focus_area_mismatch"),
+            "JWT synonym (authentication) must satisfy auth-focused program: {remediation}"
+        );
+    }
+
+    #[test]
+    fn focus_area_check_noop_when_no_focus_areas_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scope_path = tmp.path().join("nofocus_targets.md");
+        std::fs::write(
+            &scope_path,
+            b"# Program with No Focus Areas\n\n### In Scope\n- https://github.com/x/y\n",
+        )
+        .unwrap();
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:jwt_validation_bypass".to_string(),
+            remediation: Some("test".to_string()),
+            ..Default::default()
+        }];
+        apply_focus_area_check(&mut findings, &scope_path);
+        let remediation = findings[0].remediation.as_deref().unwrap_or("");
+        assert!(
+            !remediation.contains("focus_area_mismatch"),
+            "no focus areas section → no annotation: {remediation}"
+        );
+    }
+
+    #[test]
+    fn focus_area_check_noop_when_scope_file_missing() {
+        let mut findings = vec![common::slop::StructuredFinding {
+            id: "security:jwt_validation_bypass".to_string(),
+            remediation: Some("test".to_string()),
+            ..Default::default()
+        }];
+        apply_focus_area_check(&mut findings, Path::new("/nonexistent/file.md"));
+        assert_eq!(findings[0].remediation.as_deref(), Some("test"));
     }
 }

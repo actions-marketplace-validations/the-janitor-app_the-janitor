@@ -12,7 +12,7 @@ exclude = ["crates/experimental"]
 resolver = "2"
 
 [workspace.package]
-version = "10.2.0-rc.1"
+version = "10.2.11"
 edition = "2021"
 repository = "https://github.com/janitor-security/the-janitor"
 license = "BUSL-1.1"
@@ -25,7 +25,7 @@ sysinfo = "0.38"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.10", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4"] }
 libfuzzer-sys = "0.4"
 serial_test = "3"
 opentelemetry = "0.31"
@@ -72,7 +72,7 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-zig = "1.1.2"
 tree-sitter-solidity = "1.2.13"
 alloy-primitives = "1.5.7"
-prost-reflect = "0.16.3"
+prost-reflect = "0.16.4"
 protobuf-parse = "3.7.2"
 openapiv3 = "2.2.0"
 serde_yaml = "0.9.34"
@@ -101,8 +101,8 @@ toml = "1.0"
 semver = "1.0"
 
 # HTTP client (sync, used for remote audit attestation)
-ureq = { version = "3", features = ["json", "rustls"] }
-rustls = "0.23"
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2"
 
 # Post-quantum cryptography — ML-DSA-65 (FIPS 204) for BYOK local attestation
@@ -123,7 +123,7 @@ arc-swap = "1.7"
 # Cranelift JIT + WAT text-format parsing. Default features retained so all
 # required runtime types are available; LTO in the release profile strips
 # unreachable code paths, controlling the final binary footprint.
-wasmtime = { version = "44.0.0", features = ["cranelift", "wat"] }
+wasmtime = { version = "44.0.2", features = ["cranelift", "wat"] }
 
 # Git integration (C binding to libgit2 — requires libgit2-dev in build env)
 git2 = "0.20"

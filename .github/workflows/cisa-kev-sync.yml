@@ -5,8 +5,8 @@ name: CISA KEV Weekly Sync
 #   - .janitor/wisdom.rkyv           (binary Wisdom Registry)
 #   - .janitor/wisdom_manifest.json  (diffable JSON manifest of all CVE entries)
 #
-# The workflow diffs the manifest against the last committed snapshot and opens
-# a PR containing:
+# The workflow diffs the manifest against the last committed snapshot and
+# uploads an operator-review artifact containing:
 #   - Updated .janitor/cisa_kev_ids.txt  (sorted CVE-ID list for future diffs)
 #   - .janitor/kev_checklist.md          (new entries + AST gate checklist)
 #
@@ -25,24 +25,24 @@ jobs:
     name: CISA KEV Sync & Gate Checklist
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # create branch with updated snapshot
-      pull-requests: write   # open the PR
+      contents: read
 
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
           allowed-endpoints: >
             api.github.com:443
             github.com:443
+            release-assets.githubusercontent.com:443
             objects.githubusercontent.com:443
             api.thejanitor.app:443
             www.cisa.gov:443
             osv-vulnerabilities.storage.googleapis.com:443
 
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -52,26 +52,47 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/janitor-bin
-          # Download binary + integrity artifacts (exact names — avoid over-matching
-          # --pattern "janitor" which also matches janitor.sha384, janitor.sig, etc.)
+          # Mandatory artifacts: the binary plus its SHA-384 sidecar.
+          # `gh release download --pattern "janitor"` matches the literal asset
+          # name "janitor" only — it does NOT glob over janitor.sha384 / .sig.
           gh release download --repo janitor-security/the-janitor \
             --pattern "janitor" \
             --pattern "janitor.sha384" \
-            --pattern "janitor.sig" \
             --dir /tmp/janitor-bin \
             --clobber
+          # Optional artifact: ML-DSA-65 signature.  Older releases (pre-PQC)
+          # ship without one — failing the whole job because the asset is
+          # absent is a regression, so swallow the non-zero exit.
+          gh release download --repo janitor-security/the-janitor \
+            --pattern "janitor.sig" \
+            --dir /tmp/janitor-bin \
+            --clobber 2>/dev/null || true
           [ -f /tmp/janitor-bin/janitor ] || { echo "FATAL: janitor binary not found after download"; exit 1; }
           chmod +x /tmp/janitor-bin/janitor
           # Verify binary integrity before executing — mirrors the discipline in action.yml
-          /tmp/janitor-bin/janitor verify-asset \
-            --file /tmp/janitor-bin/janitor \
-            --hash /tmp/janitor-bin/janitor.sha384
+          if [ -f /tmp/janitor-bin/janitor.sig ]; then
+            /tmp/janitor-bin/janitor verify-asset \
+              --file /tmp/janitor-bin/janitor \
+              --hash /tmp/janitor-bin/janitor.sha384 \
+              --sig  /tmp/janitor-bin/janitor.sig
+          else
+            /tmp/janitor-bin/janitor verify-asset \
+              --file /tmp/janitor-bin/janitor \
+              --hash /tmp/janitor-bin/janitor.sha384
+          fi
           /tmp/janitor-bin/janitor --version
 
-      - name: Run update-wisdom --ci-mode
+      - name: Run update-wisdom --kev-manifest-only
+        # The weekly diff PR only consumes .janitor/wisdom_manifest.json — it does
+        # NOT need the wisdom.rkyv binary mirror.  Coupling this workflow to a
+        # separate (potentially-undeployed) signed-mirror endpoint was the root
+        # cause of the 2026-Q2 weekly-sync outage.  --kev-manifest-only fetches
+        # ONLY the CISA KEV catalog (with 3-attempt exponential backoff) and
+        # writes the JSON manifest, leaving full wisdom.rkyv sync to ad-hoc
+        # `janitor update-wisdom --ci-mode` runs.
         run: |
           set -euo pipefail
-          /tmp/janitor-bin/janitor update-wisdom . --ci-mode
+          /tmp/janitor-bin/janitor update-wisdom . --kev-manifest-only
           echo "Manifest written:"
           wc -l .janitor/wisdom_manifest.json
 
@@ -152,32 +173,13 @@ jobs:
           # Promote the new snapshot.
           cp .janitor/kev_ids_new.txt .janitor/cisa_kev_ids.txt
 
-      - name: Open PR with updated snapshot and checklist
+      - name: Upload updated snapshot and checklist
         if: steps.diff.outputs.new_count != '0'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TODAY=$(date +%Y-%m-%d)
-          BRANCH="chore/cisa-kev-sync-${TODAY}"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git checkout -b "${BRANCH}"
-          git add .janitor/cisa_kev_ids.txt .janitor/kev_checklist.md
-          git commit -m "chore: CISA KEV sync ${TODAY} — $(wc -l < .janitor/kev_added.txt | tr -d ' ') new entries"
-          git push origin "${BRANCH}"
-
-          # Idempotent PR creation — do not error if PR already exists for this branch.
-          EXISTING_PR=$(gh pr list --head "${BRANCH}" --json number --jq '.[0].number' 2>/dev/null || true)
-          if [[ -n "${EXISTING_PR}" ]]; then
-            echo "PR #${EXISTING_PR} already exists for branch ${BRANCH} — skipping creation."
-          else
-            gh pr create \
-              --title "chore: CISA KEV sync ${TODAY}" \
-              --body "$(cat .janitor/kev_checklist.md)" \
-              --base main \
-              --head "${BRANCH}" \
-              --label "security,intelligence"
-          fi
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cisa-kev-sync-${{ github.run_id }}
+          path: |
+            .janitor/cisa_kev_ids.txt
+            .janitor/kev_checklist.md
+          if-no-files-found: error
+          retention-days: 30

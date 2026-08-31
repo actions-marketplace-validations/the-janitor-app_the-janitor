@@ -8,9 +8,13 @@
 
 ## 1. Overview
 
-The Janitor is a **locally-executed software binary**. It does not have a backend, a cloud service, or a telemetry system. This Privacy Policy describes what data is and is not collected when you use the Software.
+The Janitor is a **locally-executed software binary**. Core analysis runs on your
+machine or your GitHub Actions runner. Some optional features make network
+requests or emit minimal metadata, and those boundaries are described below.
 
-**Short version: We do not receive your source code. We do not collect telemetry. We do not know you are using the Software unless you contact us.**
+**Short version: We do not receive your source code. Core analysis stays local.
+Optional integrations may transmit score-only metadata or a minimal rollback
+fingerprint, but not file contents, file paths, or symbol names.**
 
 ---
 
@@ -25,11 +29,11 @@ The Software does not transmit any of the following:
 | Dead symbol names or analysis results | No |
 | Audit log contents | No |
 | Machine identifiers (hostname, IP, CPU) | No |
-| Usage telemetry (commands run, frequency, flags used) | No |
+| Usage telemetry (commands run, frequency, flags used) | Minimal — see §9 |
 | Crash reports | No |
 | Email address or identity | No |
 
-The Software operates entirely offline. All analysis — reference graph construction, heuristic classification, AhoCorasick scanning, shadow-tree simulation, and structural clone detection — is performed on your local machine using only your local files.
+Core analysis operates locally. All analysis — reference graph construction, heuristic classification, AhoCorasick scanning, shadow-tree simulation, and structural clone detection — is performed on your local machine or runner using only your local files.
 
 ---
 
@@ -86,21 +90,23 @@ If you have questions about this Privacy Policy or wish to exercise any applicab
 
 ## 8. Data Collection by Deployment Model
 
-The Janitor operates in two distinct deployment modes with different data handling properties:
+The Janitor operates in two distinct deployment modes with identical source-code handling — neither transmits your code off-runner:
 
 | Aspect | CLI + GitHub Action | Janitor Sentinel (GitHub App) |
 |--------|--------------------|-----------------------------|
-| Source code transmitted | Never | Temporarily cloned to Janitor infrastructure |
-| Source code retained | N/A | Deleted immediately after scan (duration of analysis only) |
+| Source code transmitted | Never | Never — analysis runs on your GitHub Actions runner |
+| Source code retained | N/A | N/A — no server-side clone is made |
 | Bounce log | Written locally to `.janitor/bounce_log.ndjson` | Score + metadata only transmitted to Governor |
 | CBOM issued | No (unsigned) | Yes — ML-DSA-65 signed |
 
-**Sentinel mode**: When you install Janitor Sentinel as a GitHub App, source code is temporarily cloned to Janitor's Fly.io infrastructure to perform the structural analysis. The clone is deleted immediately after the analysis completes — it is never written to persistent storage. Only the structural analysis result (slop score, antipattern labels, collided PR numbers) is retained in the Governor's database.
+**Sentinel mode**: Janitor Sentinel downloads the Janitor binary to your GitHub Actions runner and executes the analysis there. Source code is never transmitted to Janitor infrastructure. Only the structural analysis result (slop score, antipattern labels, fingerprints) is transmitted from the runner to the Governor via a signed token exchange. The Governor does not receive source code, file paths, or symbol names.
 
-**Post-Architecture-Inversion (v9.7.0+)**: After the architecture inversion is deployed with `GOVERNOR_INVERT_MODE=1`, Sentinel mode will match the CLI/Action model — no source code will be transmitted to Janitor infrastructure.
+## 9. Minimal Rollback Telemetry
+
+The Software may emit a minimal zero-knowledge hash on rollback events. This hash is a structural fingerprint (not source code, not file paths, not symbol names). It is used to improve detection accuracy across the anonymized fleet. To opt out, delete `.janitor/telemetry.json`.
 
 ---
 
-## 9. Changes to This Policy
+## 10. Changes to This Policy
 
 This policy may be updated. The Effective Date at the top of this document reflects the most recent revision. Material changes will be noted in the project's release notes.

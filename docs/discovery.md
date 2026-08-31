@@ -85,6 +85,11 @@ Janitor Sentinel ships a machine-readable `mcp-manifest.json` at the repository 
 
 **Why this matters**: once registered, any internal AI agent (Copilot Workspace, a LangGraph orchestrator, a Claude-powered code review bot) can call `janitor_bounce` before proposing a merge, `janitor_silo_audit` after updating dependencies, or `janitor_visualize_ledger` when generating an executive security report — without any human in the loop and without any code leaving the environment.
 
+**Evaluation signal**: grant and pilot reviewers can reproduce the integration by
+registering the manifest, running `janitor_bounce` against a controlled PR diff,
+and verifying that the tool returns a deterministic pass/fail verdict without
+uploading source code.
+
 ### Manifest location
 
 ```
@@ -118,7 +123,7 @@ az mcp server register \
   --scope organization
 ```
 
-After registration, any Azure AI Foundry agent or Copilot Studio orchestrator in the organization can discover and invoke the nine Janitor tools by name.
+After registration, any Azure AI Foundry agent or Copilot Studio orchestrator in the organization can discover and invoke the registered Janitor tools by name.
 
 ### Ingestion: LangGraph / LangChain
 

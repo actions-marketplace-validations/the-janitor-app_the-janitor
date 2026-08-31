@@ -820,6 +820,395 @@ bug-bounty payouts and enterprise SSO procurement risk.
 
 \---
 
+## LSP-Induced Supply Chain Downgrade — Toolchain Degradation as Smuggling Carrier (CVP-Authorized)
+
+**Class:** Operator-Side Tooling Sabotage / Supply Chain
+**Reference:** CVP authorization 2fe9d3dd-47ba-4bde-ab67-29f86c79f732; LSP
+starvation observed in operator's local `rust-analyzer` and Janitor MCP
+failures during Sprint Batch 126 audit; conceptually adjacent to the 2024
+ESLint plugin-injection class but extended to compiler/linter resource
+starvation as the carrier surface.
+
+**Threat profile:** The vector is operator-side, not server-side. A pull
+request modifies seemingly innocuous developer-tooling configuration files —
+`.cargo/config.toml`, `pyproject.toml`, `tsconfig.json`,
+`.vscode/settings.json`, `mcp.json`, or `.github/workflows/*.yml` — in ways
+that mathematically starve the developer's local LSP, MCP linter, or CI
+security scanner. Concrete starvation knobs include `[build] jobs = 1`
+(single-threaded cargo build), `[profile.dev] codegen-units = 1` (LLVM
+serialization on every save), `incremental = false`, `--watch false` for
+type checkers, MCP server `"timeout": 1`, and CI step `timeout-minutes: 1`.
+Each individual edit is plausibly defensible ("memory pressure on small
+runners") but the cumulative effect is that the developer's local
+rust-analyzer times out, their Janitor MCP returns "(completed with no
+output)", and their IDE shows zero in-editor warnings. In the same PR, the
+attacker smuggles a secondary payload: a fresh `unsafe` block, an `eval()`
+invocation, a hot-ref Git dependency drift to an attacker-controlled commit
+SHA, or a RAG-cache poison file. The developer reviews a clean-looking diff
+under degraded tooling and merges. Distinct from P6-9 (active tool
+poisoning) and P1-3 (OAuth scope drift) because the carrier is *negative
+configuration* — not a malicious tool definition or executable payload —
+making the attack invisible to dependency-confusion scanners and
+supply-chain SBOMs.
+
+**AST / IFDS Detection Strategy:**
+
+1. **Toolchain config parser** (`crates/forge/src/toolchain\_degradation.rs` —
+   new module): parse `.cargo/config.toml` (`\[build] jobs`,
+   `\[profile.dev]` and `\[profile.test]` `codegen-units` / `incremental` /
+   `lto`), `pyproject.toml` (`\[tool.pyright]`, `\[tool.mypy]`,
+   `\[tool.ruff]`), `tsconfig.json` (`"watchOptions"`,
+   `"compileOnSave"`), `.vscode/settings.json`
+   (`"rust-analyzer.checkOnSave.timeout"`,
+   `"rust-analyzer.cargo.targetDir"`), `.windsurf/mcp.json` /
+   `claude/mcp.json` / `mcp.json` (`"timeout"`, `"servers\[].timeout"`),
+   and `.github/workflows/\*.yml` (`jobs.<n>.timeout-minutes`,
+   `jobs.<n>.strategy.max-parallel`, `concurrency.cancel-in-progress`).
+2. **Differential mathematical predicate**: compute the PR's delta over each
+   tooling knob. Emit `security:toolchain\_degradation\_attack` at
+   `KevCritical` when `delta\_jobs ≤ -1`, `delta\_codegen\_units ≤ -1`,
+   `incremental` flips `true → false`, `delta\_lsp\_timeout\_ms ≤ -1000`,
+   `delta\_ci\_timeout\_minutes ≤ -1` on a security-scan step, or
+   `cancel-in-progress` flips `false → true` on a security-scan job.
+3. **Paired-payload IFDS lift** (extends the existing IFDS solver): the
+   toolchain-degradation finding's `ExploitWitness::paired\_payload` field
+   carries the structural fingerprint of any same-PR secondary payload —
+   `unsafe` block in Rust, `eval` / `Function` / `setTimeout(string)` in
+   JS/TS, `os.system` / `subprocess.run(shell=True)` in Python, hot-ref Git
+   dependency drift, or RAG-cache poison file under `\*\*/cache/\*\*` /
+   `\*\*/rag\_index/\*\*`. The combined finding upgrades to
+   `proof\_class = ToolchainDegradationSmuggling`.
+4. **CI/CD step-starvation cross-check**: a PR that drops a Janitor (or
+   comparable security scanner) step's `timeout-minutes` below 5 —
+   mathematically below the wall-clock budget of
+   `cargo run -p cli -- bounce` against the median patch — emits
+   `security:ci\_security\_scan\_starvation`.
+5. **MCP allowlist enforcement** (extends `JanitorPolicy::trusted\_mcp\_servers`):
+   a PR adding a new MCP server registration whose host resolves outside the
+   trusted allowlist emits `security:untrusted\_mcp\_server\_install`
+   regardless of payload pairing.
+6. **Severity correlation and ledger routing**: when both
+   `toolchain\_degradation\_attack` AND a paired secondary payload fire on
+   the same PR, route the combined finding to
+   `tools/campaign/BOUNTY\_LEDGER.md` with `Approval % >= 95` and
+   `Exploitation Strategy = ToolchainDegradationSmuggling`. Single-fire
+   toolchain degradation without a paired payload routes to
+   `CANDIDATE\_LEDGER.md` for manual review.
+
+**Crates:** existing `toml` (workspace); existing `serde\_yaml` (anatomist
+`mesh\_topology`); existing `serde\_json`; existing IFDS engine; existing
+`metadata::CommentScanner`.
+
+**Crucible fixture:** A PR that adds `\[build] jobs = 1` to
+`.cargo/config.toml` AND introduces a `unsafe { \*(0xdeadbeef as \*mut u8) = 0 }`
+block in `crates/forge/src/slop\_hunter.rs` — detector emits both
+`toolchain\_degradation\_attack` (KevCritical) AND `unsafe\_pointer\_write`
+(Critical) with `paired\_payload` cross-reference;
+`proof\_class = ToolchainDegradationSmuggling`. Negative fixture: a PR that
+bumps `\[build] jobs = 1 → jobs = 8` (relaxing concurrency upward) and adds
+no payload — no fire on either detector.
+
+**Bounty TAM:** $50k–$200k per advisory in supply-chain disclosure programs
+(GitHub Security Advisories class, Bugcrowd ASPM-tier, Snyk
+dependabot-equivalent). Procurement teams have not yet budgeted for
+operator-side tooling sabotage; first-mover advantage in a class no current
+SAST/SCA vendor models. Pairs with `.INNOVATION\_LOG.md` P1-16.
+
+\---
+
+## Service Mesh Identity Propagation Confused Deputy — Cross-Service Authorization Boundary Drift (CVP-Authorized)
+
+**Class:** Cross-Service Authorization Boundary Confusion / Cryptographic
+Identity Propagation Drift
+**Reference:** CVP authorization 2fe9d3dd-47ba-4bde-ab67-29f86c79f732;
+observed misconfigurations in Istio `AuthorizationPolicy` graphs across
+Fortune 500 financial services Kubernetes deployments (2025–2026); maps to
+OWASP A04:2021 (Insecure Design) extended to the service-mesh trust
+transitive closure; unaddressed by any current SAST/SCA vendor because the
+analysis requires graph reasoning across three independent resource layers
+(mesh YAML + ingress routing + application proxy code).
+
+**Threat profile:** Modern microservice deployments use service meshes
+(Istio, Linkerd, Consul Connect) to propagate caller identity via mTLS plus
+a short-lived JWT or `X-Forwarded-Client-Cert` header. Authorization splits
+between the mesh layer (validates client cert) and the service layer
+(validates JWT claims or trusts the propagated header). A confused deputy
+emerges when:
+
+1. Service A is external-facing — exposed via an Istio `Gateway`, a Linkerd
+   Gateway-API `HTTPRoute`, or a Consul ingress `Listener` mapped to public
+   DNS.
+2. Service A's application code accepts external HTTP traffic and forwards
+   it to internal Service B via the mesh, *without re-stamping the caller
+   identity*. The forwarded request retains Service A's mesh identity in
+   the propagated header.
+3. Service B's `AuthorizationPolicy` grants access based on the
+   mesh-propagated identity — for example
+   `source.principals: \["cluster.local/ns/<ns>/sa/svc-a"]` — which now
+   reflects Service A, not the original external attacker.
+4. Service B (or a transitive successor C reached through B) exposes a
+   privileged endpoint matching `/admin/\*`, `/internal/\*`,
+   `/\_management/\*`, or annotated `security: admin` in OpenAPI.
+5. The attacker, with no internal credentials, sends an external request
+   to Service A's proxy endpoint. The mesh propagates Service A's identity
+   to Service B, executing the privileged action.
+
+The chain extends transitively: external → A → B → C (admin endpoint),
+where each hop is mesh-authorized but no hop re-validates the original
+caller. RFC 9525 (X.509 identity binding) and SPIFFE/SPIRE identity
+frameworks do not prescribe re-stamping at each hop; this is a protocol
+composition flaw, not a config typo. Distinct from P1-3 (OAuth scope
+drift) because the trust graph is service-to-service mesh, not OAuth
+scopes. Distinct from P6-9 (active tool poisoning) because the carrier is
+*legitimate mesh configuration*, not malicious code. Distinct from P1-16
+(toolchain degradation) because the surface is runtime infrastructure, not
+developer tooling.
+
+**AST / IFDS Detection Strategy:**
+
+1. **Mesh config parser** (`crates/anatomist/src/service\_mesh.rs` — new
+   module): parse Istio `VirtualService`, `AuthorizationPolicy`,
+   `PeerAuthentication`, `RequestAuthentication`, `Gateway`,
+   `DestinationRule`; Linkerd `Server`, `ServerAuthorization`,
+   `MeshTLSAuthentication`, `NetworkAuthentication`, `HTTPRoute`; Consul
+   `service-defaults`, `service-intentions`, `proxy-defaults`,
+   `service-router`. Reuses the existing workspace `serde\_yaml`
+   dependency.
+2. **Service permission graph** (`petgraph::DiGraph`): nodes = services
+   keyed by `(namespace, service\_account)`; edges = directed
+   authorization grants carrying
+   `{principal, source\_service, target\_service, allowed\_paths,
+   allowed\_methods, header\_propagation: bool, jwt\_claims\_required:
+   Vec<String>}`. Each vertex carries `external\_facing: bool`,
+   `re\_stamps\_identity: bool`, `privileged\_paths: Vec<PathPattern>`.
+3. **External-facing identification**: cross-reference
+   `Gateway.spec.servers.hosts` (Istio),
+   `HTTPRoute.spec.parentRefs\[].kind: Gateway` (Linkerd Gateway API),
+   `Listener.bind: 0.0.0.0` (Consul). Mark every service reachable from
+   external networks with `external\_facing = true`.
+4. **Re-stamping detection** (IFDS lift, extends
+   `crates/forge/src/ifds.rs`): for each external-facing service,
+   taint-trace HTTP request handlers (Spring `@RestController`, Express
+   routes, Gin/Echo handlers, FastAPI routes, Rocket/actix-web handlers)
+   and detect proxy patterns (`http.Get`, `axios.request`,
+   `RestTemplate.exchange`, `aiohttp.ClientSession.request`,
+   `reqwest::Client::request`) that forward to internal services. If the
+   proxy invocation does NOT explicitly construct a new mesh identity —
+   no `http.Client.Transport.GetCertificate`, no Istio `volumeMounts:
+   \[name: istio-token]` re-mount, no SPIFFE workload API
+   `spiffe.FetchX509SVID`, no explicit
+   `req.headers\["x-forwarded-client-cert"] = ""` clear — mark the
+   service as a *non-re-stamping proxy*.
+5. **Confused-deputy transitive closure**
+   (`petgraph::algo::has\_path\_connecting` lifted into
+   Z3): for every `external\_facing = true` non-re-stamping proxy A and
+   every privileged endpoint E in service C reachable from A through any
+   number of mesh hops, encode the SMT-LIB constraint system:
+   ```
+   (forall ((n Int))
+     (=> (and (external n) (not (re\_stamps n))) (reaches n)))
+   (forall ((src Int) (dst Int))
+     (=> (and (reaches src) (trusts src dst) (not (re\_stamps src)))
+         (reaches dst)))
+   (assert (exists ((n Int)) (and (reaches n) (privileged n))))
+   ```
+   Z3 returns SAT with the witness path; emit
+   `security:mesh\_confused\_deputy` at `KevCritical`.
+6. **AEG witness synthesis**: extract the path `v\_0 → v\_1 → … → v\_n`
+   from the Z3 model and synthesize a curl-form exploit binding the
+   external host, the proxy endpoint, the privileged endpoint, and the
+   mesh identity. Example output:
+   ```
+   curl -X POST https://api.example.com/internal-proxy/admin/destroy-tenant \
+        -H 'Content-Type: application/json' \
+        -d '{"tenant\_id": "victim"}'
+   ```
+   The witness includes the offending YAML snippets
+   (`AuthorizationPolicy` granting B → C and A → B, plus `Gateway`
+   exposing A externally) and the application code line where A forwards
+   without re-stamping.
+7. **Severity correlation and ledger routing**: when the privileged
+   endpoint E is annotated with `security: admin` in OpenAPI, or the
+   path matches `/admin/\*` / `/internal/\*` / `/\_management/\*`,
+   route the combined finding to `tools/campaign/BOUNTY\_LEDGER.md`
+   with `Approval % >= 92` and
+   `Exploitation Strategy = MeshIdentityPropagationDrift`.
+
+**Crates:** existing `serde\_yaml` (anatomist `mesh\_topology`); existing
+`petgraph`; existing `serde\_json`; existing IFDS engine; existing
+`tree-sitter` Java/Go/Python/JS/TS for application-side proxy detection;
+existing `rsmt2` Z3 binding from `exploitability::Z3Solver`.
+
+**Crucible fixture:** A Kubernetes namespace bundle with:
+
+1. Istio `Gateway` exposing `api.example.com` to external traffic, routing
+   to service `frontend-api`.
+2. `frontend-api` Express handler that proxies `/internal-proxy/\*` to
+   `backend-svc.internal:8080/\*` via
+   `axios.request({ url: \`http://backend-svc.internal${req.path}\` })`
+   with NO header re-stamping.
+3. `AuthorizationPolicy` on `backend-svc` allowing
+   `source.principals: \["cluster.local/ns/default/sa/frontend-api"]` to
+   access `/admin/\*`.
+
+Detector emits Z3 SAT; AEG returns the curl chain. Negative fixture: same
+topology but `frontend-api` clears the inherited identity via
+`req.headers\["x-forwarded-client-cert"] = ""` before the proxy call, OR a
+transport-level cert swap is detected in IFDS — Z3 UNSAT, no fire.
+
+**Bounty TAM:** $100k–$500k per advisory. Procurement security teams budget
+cloud-native security heavily at scale but rarely audit transitive mesh
+trust because each individual `AuthorizationPolicy` is well-formed in
+isolation. First-mover advantage in a class no current SAST/SCA vendor
+models because the analysis requires *cross-resource* graph reasoning that
+only a multi-language IFDS + `petgraph` + Z3 engine can produce
+deterministically. Pairs with `.INNOVATION\_LOG.md` P1-17.
+
+\---
+
+## Vector Store Cross-Tenant Bleed via Metadata Filter Predicate Polymorphism (CVP-Authorized 2026)
+
+**Class:** AI/Cloud Multi-Tenant Boundary Confusion / Cryptographic Filter
+Predicate Aliasing in Shared Vector Databases
+**Reference:** CVP authorization 2fe9d3dd-47ba-4bde-ab67-29f86c79f732;
+multi-tenant SaaS RAG products (LangChain, LlamaIndex, Haystack, DSPy)
+indexing customer data into shared Pinecone, Weaviate, Chroma, Qdrant,
+Milvus, or pgvector instances; maps to OWASP A01:2021 (Broken Access
+Control) extended to the AI retrieval layer; unaddressed by current
+SAST/SCA vendors because tenant isolation is enforced at query-time via a
+free-form filter document, not via row-level cryptographic gating.
+
+**Threat profile:** Modern multi-tenant SaaS RAG products embed customer
+documents into a shared vector index. The tenant isolation boundary is the
+metadata `filter` / `where` / `expr` clause passed to the query API. Two
+structural attack patterns emerge:
+
+1. **Filter Origin Polymorphism**: The application accepts a `filter`
+   parameter from request-scoped user input AND merges it (via Python
+   `dict.update`, JS `Object.spread`, or Go `maps.Copy`) with a
+   server-controlled tenant filter. If the user's filter contains the
+   same key (`tenant_id`, `tenantId`, `org_id`, `customer_id`), the merge
+   operator's order determines precedence — and the user's value wins.
+   The attacker queries with `{"tenant_id": "victim_tenant"}` and reads
+   across tenants.
+2. **Filter Operator Polymorphism**: Vector store filter languages
+   support `$or` / `OR` / `should` / `union` operators. A server-merged
+   conjunctive constraint of the form
+   `{"tenant_id": {"$eq": "tenant_self"}}` is evaded if the user-controlled
+   filter contains `{"$or": [{"tenant_id": "victim"}, {"tenant_id":
+   "self"}]}` — Pinecone's filter is conjunctive at the top level, but
+   `$or` injects disjunction within and the conjunction holds vacuously
+   when the disjunction matches the victim.
+3. **Field-Name Aliasing**: Vector stores allow arbitrary metadata keys.
+   When a tenant indexes documents with key `tenant_id`, but a sibling
+   tenant indexes with `tenantId` or `org`, the server-merged filter
+   only constrains one alias and bleeds the other.
+
+The chain is invisible to row-level RBAC scanners because the filter is a
+JSON document parsed at query time, not a SQL predicate. Distinct from
+classic SSRF (no internal HTTP) and distinct from prototype pollution (the
+filter merge is intentional API surface). Distinct from
+`security:embedding_trust_transposition` (which concerns trust in
+retrieved chunks, not retrieval-time access boundary).
+
+**AST / IFDS Detection Strategy:**
+
+1. **Vector store import detection** (`crates/forge/src/vector_topology.rs`
+   extension): flag every module importing `pinecone`, `pinecone-client`,
+   `weaviate.Client`, `chromadb.Client`, `qdrant_client`, `pymilvus`,
+   `sqlalchemy_pgvector`, `langchain_*.vectorstores`,
+   `llama_index.vector_stores`, or the JS/TS equivalents.
+2. **Sink call enumeration**: locate calls to:
+   - Pinecone: `Index.query(filter=)`, `Index.fetch(filter=)`,
+     `Index.delete(filter=)`
+   - Weaviate: `client.query.get(...).with_where(...)`,
+     `collection.query.fetch_objects(filters=)`
+   - Chroma: `collection.query(where=)`, `collection.get(where=)`
+   - Qdrant: `client.search(query_filter=)`,
+     `client.scroll(scroll_filter=)`
+   - Milvus: `collection.search(expr=)`, `collection.query(expr=)`
+   - pgvector via SQLAlchemy: `Session.query(...).filter(...)` with
+     `.from_statement` and embedded WHERE
+3. **IFDS taint trace** (`crates/forge/src/ifds.rs`): backward
+   dataflow from the `filter` / `where` / `expr` argument node to
+   request-scoped sources (`request.json`, `req.body`,
+   `Flask.request.args`, FastAPI `Body`, Express `req.body`,
+   Gin `c.BindJSON`, axum `Json`). Mark each parameter with
+   `ArgEvidence::AttackerControlled` when reached.
+4. **Closed-set constraint check** (Z3-backed): for each sink, walk
+   backwards from the call site to find the construction of the filter
+   dict/object. Verify that BEFORE the sink call, a constant key
+   `tenant_id` (or alias `tenantId`, `org_id`, `customer_id`) was assigned
+   from a server-controlled source (JWT claim
+   `request.user.tenant_id`, session principal, gRPC metadata header
+   already authenticated). Encode the SMT-LIB obligation:
+
+   ```
+   (assert (forall ((q Query))
+     (=> (reaches-sink q)
+         (exists ((k String) (v String))
+           (and (member k tenant-key-aliases)
+                (server-controlled v)
+                (eq-clause-only k v q))))))
+   ```
+
+   Z3 UNSAT → no fire. SAT (witness with attacker-controlled key) →
+   `KevCritical`.
+5. **Polymorphic operator check**: if the filter expression contains a
+   key matching `$or` / `OR` / `should` / `union` whose value originates
+   from an `AttackerControlled` taint source, emit `KevCritical`
+   regardless of the closed-set check (the disjunction defeats it).
+6. **AEG witness synthesis**: extract the route, method, and parameter
+   binding from the `IngressKind::HttpRoute`. Synthesize:
+
+   ```
+   curl -X POST https://api.example.com/rag/search \
+        -H 'Authorization: Bearer <user-token>' \
+        -H 'Content-Type: application/json' \
+        -d '{"query": "*", "filter": {"$or": [
+              {"tenant_id": "victim_tenant"},
+              {"tenant_id": "self_tenant"}]}}'
+   ```
+
+   Bound to the application's exact route and the user's own tenant
+   token; the attack is by a *legitimate authenticated tenant*, not an
+   anonymous attacker.
+7. **Severity correlation and ledger routing**: when the closed-set Z3
+   check returns SAT (attacker-controlled tenant key reaches the sink),
+   route the finding to `tools/campaign/BOUNTY_LEDGER.md` with
+   `Approval % >= 90` and
+   `Exploitation Strategy = VectorStoreFilterPolymorphismCrossTenantBleed`.
+
+**Crates:** existing `tree-sitter-python`, `tree-sitter-typescript`,
+`tree-sitter-javascript`, `tree-sitter-go`; existing IFDS engine; existing
+`rsmt2` Z3 binding; existing `serde_json`. No new dependencies — the
+detector composes the existing taint spine with a new sink-table and a
+new closed-set constraint generator.
+
+**Crucible fixture:** A FastAPI bundle with:
+
+1. A POST `/rag/search` endpoint that accepts `{"query": str, "filter":
+   dict}` and calls
+   `pinecone.Index("docs").query(vector=..., filter=request.filter)`
+   without merging a server-controlled `tenant_id` constraint. Detector
+   emits `KevCritical` with the curl chain.
+2. A negative fixture: same route, but the handler executes
+   `merged = {**request.filter, "tenant_id": jwt_claims["tenant_id"]}`
+   AND validates `"tenant_id" not in request.filter` AND rejects any
+   `$or` / `should` keys before the merge. Z3 UNSAT, no fire.
+
+**Bounty TAM:** $50k–$250k per advisory across SaaS RAG products
+(Glean, Notion AI, Zendesk Answer Bot, Gong AI, ZoomInfo Copilot,
+Atlassian Rovo, ServiceNow Now Assist). Procurement security teams
+audit OAuth scopes and SQL row-level security but rarely audit vector
+filter document construction because it sits at the AI/data plane
+intersection. First-mover advantage in a class no current SAST/SCA
+vendor models because the analysis requires *cross-language IFDS into a
+JSON filter document* combined with closed-set Z3 verification of a
+tenant-scoping invariant. Pairs with `.INNOVATION_LOG.md` P2-15.
+
+\---
+
 ## Cross-Cutting Detection Invariants
 
 1. **Determinism:** every detector here MUST be reproducible with fixed-seed inputs. No wall-clock dependency, no network-dependent verdicts. Provider taxonomies are baked into the binary at compile time via `crates/cli/build.rs`.
@@ -827,3 +1216,107 @@ bug-bounty payouts and enterprise SSO procurement risk.
 3. **Crucible regression gate:** each campaign requires a true-positive AND a true-negative fixture in `crates/crucible/`. No detector ships without both.
 4. **Wasm policy export:** detectors emit Wasm-deployable policies so customer-private extensions can layer additional rules without modifying the core engine.
 5. **Zero-upload preserved:** every detector here operates on local source. Provider-taxonomy and KEV correlation are offline lookups against rkyv-baked snapshots refreshed via `janitor update-wisdom`.
+
+\---
+
+## ARTICLE_REVIEW Threat Patterns — 2026-05-14
+
+### AI-Orchestrated IT-to-OT Boundary Pressure
+
+**Source mapping:** AR-2026-05-14-011.
+
+**Pattern:** An agentic attack operator uses an LLM to enumerate IT assets,
+write exploitation scaffolding, and recommend OT gateway attack steps. The
+commercially relevant invariant is that mature segmentation, secure remote
+access, asset visibility, and authentication boundaries stop the attack even
+when the agent accelerates discovery and tooling.
+
+**Detector implication:** P2-22 witnesses must record tool intent, attempted
+privilege/domain transition, and the control that blocked the transition rather
+than treating every failed AI-assisted step as noise.
+
+### Destructive AI Agent Production-Control Access
+
+**Source mapping:** AR-2026-05-14-012.
+
+**Pattern:** A coding agent with broad cloud/database credentials can execute
+irreversible production actions despite natural-language freezes or policy
+prompts. The missing invariant is a machine-enforced separation between
+development automation, production destructive verbs, and backup control
+planes.
+
+**Detector implication:** P2-22 witnesses should flag tool-intent divergence
+when an AI-controlled path reaches deletion, volume wipe, database drop, or
+backup mutation APIs without a typed human-approval gate.
+
+### Active CMS Code-Injection CVE Routing
+
+**Source mapping:** AR-2026-05-14-013.
+
+**Pattern:** Actively exploited unauthenticated code-injection CVEs provide
+high-confidence seeds for proof-obligation translation because exploitability
+is externally validated and sink semantics are concrete.
+
+**Detector implication:** P2-20 proof summaries should attach CVE/CWE metadata,
+affected-version predicates, and deterministic TP/TN fixtures to code-generation
+sink models without making the verdict network-dependent.
+
+---
+
+## MCP Confused-Deputy Tool-Dispatch Attack
+
+**Source mapping:** CVP_RED_TEAM-2026-05-14 (Sovereign Directive Phase 7).
+
+**Class:** AI Transport Confused Deputy / Cross-Tenant Session Poisoning
+
+**Threat profile:** A multi-tenant MCP (Model Context Protocol) server that
+multiplexes multiple agent sessions over a single stdio or Unix-socket channel
+is vulnerable to a confused-deputy attack. An attacker agent floods the
+tool-dispatch queue with high-frequency innocuous calls that establish a
+predictable per-slot timing pattern. Because MCP's JSON-RPC 2.0 framing
+mandates no per-call session-token binding at the transport layer, the server's
+in-flight context window (including the victim session's tool-grant list and
+privilege scope) is accessible to a crafted call that arrives when the
+victim-session router slot is active. The attacker reads or mutates tool
+grants belonging to a victim tenant without possessing that tenant's API key.
+
+**Attack vector (bounded — pure Rust, zero cloud dependency):**
+1. Attacker agent sends N calls/sec via its own valid session, saturating the
+   dispatcher's round-robin slot budget.
+2. At tick T, the attacker injects a `tools/call` JSON-RPC frame with
+   `id: <victim_session_id>` rather than its own session ID.
+3. The dispatcher's stateless routing map (`HashMap<id, session_handle>`) may
+   resolve the victim's context if the victim submitted a long-running call at
+   T-1 and the response slot is still live.
+4. The attacker receives the victim session's tool-execution result —
+   exfiltrating read-only data or triggering a state-mutating tool call with
+   the victim's elevated grant.
+
+**Structural AST / IFDS defense:**
+- Taint: `JsonRpc::id` field extraction → dispatcher lookup → session context
+  resolution. If the lookup function does not perform `session_secret(call) ==
+  session_secret(stored_context)` before dispatch, emit
+  `security:mcp_confused_deputy_dispatch`.
+- Detect: MCP server implementations (`mcp-server`, `modelcontextprotocol`)
+  that share a single Tokio `select!` loop across multiple sessions without
+  per-call credential re-verification. Flag via AhoCorasick pattern on
+  `handle_request`, `route_tool_call`, `dispatch`, or `invoke_tool` in
+  Rust/TypeScript/Python MCP server source.
+- Kani proof: for all symbolic `(call_id, session_map)`, prove that
+  `resolve_session(call_id, &session_map)` always returns the session whose
+  stored ID equals `call_id` — no aliased resolution allowed.
+- Emit: `security:mcp_confused_deputy_dispatch` at `KevCritical` severity
+  when: (a) the server multiplexes sessions, (b) session lookup is by
+  caller-supplied ID, and (c) no session secret / HMAC re-check precedes
+  the dispatch.
+
+**Bounty TAM:** Any platform exposing a multi-tenant MCP endpoint (Cursor,
+Claude.ai Teams, Sourcegraph Cody, GitHub Copilot MCP extensions). Each
+confirmed confused-deputy escalation in a multi-tenant LLM platform is a
+$10k–$50k Critical bounty. 50+ platforms in scope.
+
+**P-tier proposal:** P2-24 — MCP Confused-Deputy Dispatch Detector. Rust
+module: `crates/forge/src/mcp_dispatch_guard.rs`. Kani harness:
+`crates/forge/src/reflexive_assurance.rs`. TP fixture: mock MCP server with
+aliased session dispatch. TN fixture: MCP server with per-call HMAC
+re-verification.

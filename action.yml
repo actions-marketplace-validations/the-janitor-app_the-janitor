@@ -1,11 +1,12 @@
 name: 'Janitor Firewall'
 description: >
   Zero-upload structural firewall for AI-generated PRs.
-  Fails hard on any error — symmetric failure ensures the Governor Check Run
-  is never left pending. The sole PR gate is the 'Janitor Integrity Check'
-  run issued by the Governor via the GitHub Checks API.
+  Fails hard on any error — symmetric failure ensures the gate is never left
+  pending. When a Governor URL is configured, the canonical PR verdict is the
+  'Janitor Integrity Check' run issued through the GitHub Checks API. When no
+  Governor URL is configured, the workflow job itself is the gate.
 
-# Only three inputs. All other configuration is governor-side.
+# Only four inputs. All other configuration is governor-side.
 inputs:
   token:
     description: 'GitHub token (contents: read, pull-requests: read)'
@@ -25,10 +26,21 @@ inputs:
   governor_url:
     description: >
       Base URL of your Sovereign Governor deployment.
-      The Janitor does not use a cloud default — you MUST configure your own
-      Governor endpoint.  Example: https://governor.your-org.internal
-      Contact sales@thejanitor.app to provision a hosted or self-hosted Governor.
-    required: true
+      Optional: when omitted, the action runs a local-only bounce gate on the
+      runner and fails the job on a rejected patch, but does not POST to a
+      Governor.  Provide a URL to publish the verdict through the Governor
+      control plane.  Example: https://governor.your-org.internal
+    required: false
+    default: ''
+  pr_number:
+    description: >
+      PR number override.  Set when invoking via workflow_dispatch to
+      re-trigger the gate after a pull_request.opened event was dropped
+      by GitHub Actions (Governor Janitor Integrity Check timed_out with
+      no gate run recorded).  When omitted, resolved from
+      github.event.pull_request.number.
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -49,15 +61,17 @@ runs:
           echo "failed to resolve bootstrap release tag" >&2
           exit 1
         fi
-        echo "tag=${BOOTSTRAP_TAG}" >> "$GITHUB_OUTPUT"
         echo "BOOTSTRAP_TAG=${BOOTSTRAP_TAG}" >> "$GITHUB_ENV"
+        echo "BOOTSTRAP_DIR=/tmp/janitor-bin/bootstrap/${BOOTSTRAP_TAG}" >> "$GITHUB_ENV"
+        echo "CURRENT_DIR=/tmp/janitor-bin/current" >> "$GITHUB_ENV"
+        echo "JANITOR_BIN=/tmp/janitor-bin/current/janitor" >> "$GITHUB_ENV"
 
     - name: Restore Bootstrap Cache
       id: bootstrap-cache
-      uses: actions/cache@v4
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: /tmp/janitor-bin/bootstrap
-        key: janitor-bootstrap-${{ runner.os }}-${{ steps.bootstrap.outputs.tag }}
+        key: janitor-bootstrap-${{ runner.os }}-${{ env.BOOTSTRAP_TAG }}
 
     # Step 1 — Download and verify the Janitor binary via non-circular trust chain.
     #
@@ -81,24 +95,40 @@ runs:
     #
     - name: Download and Verify Janitor Binary
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
         ACTION_TAG="${{ github.action_ref }}"
+        # When the action is consumed via `uses: ./` (dogfood / self-host),
+        # github.action_ref is empty.  Fall back to BOOTSTRAP_TAG so the gate
+        # still verifies the latest published artifact instead of resolving to
+        # the URL `…/releases/download/v/janitor` (404).
+        if [ -z "${ACTION_TAG}" ]; then
+            ACTION_TAG="${BOOTSTRAP_TAG}"
+        fi
         # Normalize: ensure the tag starts with 'v' for the GitHub Release URL.
         [[ "${ACTION_TAG}" == v* ]] || ACTION_TAG="v${ACTION_TAG}"
-        CURRENT_DIR=/tmp/janitor-bin/current
-        BOOTSTRAP_DIR=/tmp/janitor-bin/bootstrap/${BOOTSTRAP_TAG}
         mkdir -p "${CURRENT_DIR}" "${BOOTSTRAP_DIR}"
-        BASE_URL="https://github.com/janitor-security/the-janitor/releases/download/${ACTION_TAG}"
-        BOOTSTRAP_URL="https://github.com/janitor-security/the-janitor/releases/download/${BOOTSTRAP_TAG}"
+        # Use `gh release download` (authenticated GitHub API) rather than raw curl.
+        # Direct curl follows a 302 redirect to S3 with a URL-signed token
+        # (X-Amz-SignedHeaders=host).  Forwarding an Authorization header to S3
+        # causes 401 because X-Amz-SignedHeaders=host means only `host` is signed —
+        # any additional header breaks the S3 signature check.  `gh` uses the API
+        # endpoint and handles auth+redirect correctly without forwarding the token.
 
         # ── Download current release artifacts.
-        curl -fsSL "${BASE_URL}/janitor" -o "${CURRENT_DIR}/janitor" &
-        curl -fsSL "${BASE_URL}/janitor.sha384" -o "${CURRENT_DIR}/janitor.sha384" &
-        (
-          curl -fsSL "${BASE_URL}/janitor.sig" -o "${CURRENT_DIR}/janitor.sig" || true
-        ) &
-        wait
+        gh release download "${ACTION_TAG}" \
+          --repo janitor-security/the-janitor \
+          --pattern "janitor" \
+          --pattern "janitor.sha384" \
+          --dir "${CURRENT_DIR}" \
+          --clobber
+        gh release download "${ACTION_TAG}" \
+          --repo janitor-security/the-janitor \
+          --pattern "janitor.sig" \
+          --dir "${CURRENT_DIR}" \
+          --clobber 2>/dev/null || true
 
         # ── Bootstrap: fetch the previous known-good Janitor binary as the verifier.
         # This binary is from a prior release cycle whose integrity was already
@@ -106,12 +136,17 @@ runs:
         # authenticate the current release artifact without relying on any asset
         # co-hosted with the binary under verification (circular trust eliminated).
         if [ ! -x "${BOOTSTRAP_DIR}/janitor" ]; then
-          curl -fsSL "${BOOTSTRAP_URL}/janitor" -o "${BOOTSTRAP_DIR}/janitor" &
-          curl -fsSL "${BOOTSTRAP_URL}/janitor.sha384" -o "${BOOTSTRAP_DIR}/janitor.sha384" &
-          (
-            curl -fsSL "${BOOTSTRAP_URL}/janitor.sig" -o "${BOOTSTRAP_DIR}/janitor.sig" || true
-          ) &
-          wait
+          gh release download "${BOOTSTRAP_TAG}" \
+            --repo janitor-security/the-janitor \
+            --pattern "janitor" \
+            --pattern "janitor.sha384" \
+            --dir "${BOOTSTRAP_DIR}" \
+            --clobber
+          gh release download "${BOOTSTRAP_TAG}" \
+            --repo janitor-security/the-janitor \
+            --pattern "janitor.sig" \
+            --dir "${BOOTSTRAP_DIR}" \
+            --clobber 2>/dev/null || true
         fi
 
         BOOTSTRAP_BIN="${BOOTSTRAP_DIR}/janitor"
@@ -135,23 +170,23 @@ runs:
                 --hash "${CURRENT_DIR}/janitor.sha384"
             echo "Trust chain verified: SHA-384-only via bootstrap ${BOOTSTRAP_TAG} (no .sig)"
         fi
-
-        chmod +x "${CURRENT_DIR}/janitor"
-        echo "JANITOR_BIN=${CURRENT_DIR}/janitor" >> "$GITHUB_ENV"
+        chmod +x "${JANITOR_BIN}"
 
     # Step 4 — Extract the PR unified diff.
+    # Also runs on workflow_dispatch re-triggers (inputs.pr_number set).
     - name: Extract Patch
-      if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+      if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'workflow_dispatch' && inputs.pr_number != '') }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        gh pr diff "${{ github.event.pull_request.number }}" \
+        PR_NUM="${{ inputs.pr_number || github.event.pull_request.number }}"
+        gh pr diff "${PR_NUM}" \
           --repo "${{ github.repository }}" \
           > .janitor-pr.patch
 
-    # Step 5 — Exchange credentials, run bounce, POST result to Governor.
+    # Step 5 — Run bounce locally, and POST the result to the Governor when configured.
     #
     # set -eo pipefail: any command failure (curl, janitor bounce, jq) exits
     # immediately with a non-zero code, failing the Action visibly rather than
@@ -159,47 +194,111 @@ runs:
     # for 9+ hours.  Symmetric failure — the workflow fails when the engine
     # fails; it succeeds when the engine succeeds.
     - name: Execute Stateless Firewall
+      env:
+        GH_TOKEN: ${{ inputs.token }}
       shell: bash
       run: |
         set -euo pipefail
+        # Resolve HEAD_SHA: prefer PR event context; fall back to gh pr view
+        # for workflow_dispatch re-triggers where the event payload is absent.
         HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+        if [ -z "${HEAD_SHA}" ]; then
+          _PR_NUM="${{ inputs.pr_number }}"
+          if [ -n "${_PR_NUM}" ]; then
+            HEAD_SHA="$(gh pr view "${_PR_NUM}" \
+              --repo "${{ github.repository }}" \
+              --json headRefOid -q .headRefOid)"
+          fi
+        fi
+        GOVERNOR="${{ inputs.governor_url }}"
+        GOVERNOR_CURL_OPTS=(--fail --show-error --silent --connect-timeout 5 --max-time 30 --retry 0)
+        JANITOR_TIMEOUT_SECONDS=120
+        _PR_NUM_RESOLVED="${{ inputs.pr_number || github.event.pull_request.number }}"
+        BOUNCE_ARGS=(
+          bounce .
+          --patch .janitor-pr.patch
+          --pr-number "${_PR_NUM_RESOLVED}"
+          --head-sha "$HEAD_SHA"
+        )
+        if [ "${{ inputs.deep_scan }}" = "true" ]; then
+          BOUNCE_ARGS+=(--deep-scan)
+        fi
+
+        # Dependabot PRs do not receive repository secrets.  When no Governor
+        # endpoint is configured, enforce the gate locally by parsing the JSON
+        # verdict emitted by `janitor bounce`.
+        if [ -z "${GOVERNOR}" ]; then
+            echo "Governor URL absent — running local-only structural gate."
+            BOUNCE_OUT=$(timeout "${JANITOR_TIMEOUT_SECONDS}s" "$JANITOR_BIN" "${BOUNCE_ARGS[@]}" --format json)
+            printf '%s\n' "${BOUNCE_OUT}"
+            BOUNCE_JSON=$(printf '%s\n' "${BOUNCE_OUT}" | sed -n '/^{/,/^}/p')
+            if [ -z "${BOUNCE_JSON}" ]; then
+                echo "failed to parse local bounce JSON verdict" >&2
+                exit 1
+            fi
+            GATE_PASSED="$(printf '%s\n' "${BOUNCE_JSON}" | jq -er '.gate_passed')"
+            # Post a named commit status so the verdict appears as "Janitor Integrity Check"
+            # on the PR even when running without a Governor URL.
+            if [ -n "${HEAD_SHA}" ] && [ -n "${{ github.repository }}" ]; then
+                STATUS_STATE="failure"
+                STATUS_DESC="Structural gate rejected patch (local-only mode)"
+                if [ "${GATE_PASSED}" = "true" ]; then
+                    STATUS_STATE="success"
+                    STATUS_DESC="Structural gate passed (local-only mode)"
+                fi
+                gh api \
+                    --method POST \
+                    "repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+                    -f state="${STATUS_STATE}" \
+                    -f context="Janitor Integrity Check" \
+                    -f description="${STATUS_DESC}" \
+                    --silent 2>/dev/null || true
+            fi
+            if [ "${GATE_PASSED}" != "true" ]; then
+                echo "Janitor gate rejected patch in local-only mode." >&2
+                exit 1
+            fi
+            exit 0
+        fi
 
         # Resolve installation ID — prefer explicit input, fall back to the
         # installation context embedded in the App's webhook event payload.
         # If still absent or 0, call /v1/resolve-id to auto-resolve via the
         # Governor's App token — eliminates the "Wrong ID" support overhead.
         INSTALL_ID="${{ inputs.installation_id || github.event.installation.id || '0' }}"
-        GOVERNOR="${{ inputs.governor_url }}"
         if [ "${INSTALL_ID}" = "0" ] || [ -z "${INSTALL_ID}" ]; then
-            RESOLVED=$(curl -sf -X POST \
-                "${GOVERNOR}/v1/resolve-id" \
+            # resolve-id is best-effort — a 429 or network blip must never abort
+            # the gate.  Omit --fail so curl exits 0 on HTTP errors; fall back
+            # to '{}' so jq always gets valid JSON.
+            _RESOLVE_BODY=$(curl --show-error --silent --connect-timeout 5 --max-time 30 \
+                -X POST "${GOVERNOR}/v1/resolve-id" \
                 -H "Content-Type: application/json" \
-                -d "{\"repo_slug\":\"${{ github.repository }}\"}" \
-                | jq -r '.installation_id // 0')
+                -d "{\"repo_slug\":\"${{ github.repository }}\"}" 2>/dev/null || echo '{}')
+            RESOLVED=$(printf '%s\n' "${_RESOLVE_BODY}" | jq -r '.installation_id // 0' 2>/dev/null || echo '0')
             if [ "${RESOLVED:-0}" != "0" ]; then
                 INSTALL_ID="${RESOLVED}"
             fi
         fi
 
+        # _PR_NUM_RESOLVED is set above from inputs.pr_number || github.event.pull_request.number.
+        # Do NOT use ${{ github.event.pull_request.number }} here — it is empty on
+        # workflow_dispatch, which causes jq --argjson to receive an empty string
+        # and exit 2 (invalid JSON), blocking every manual re-trigger.
         TOKEN_PAYLOAD=$(jq -n \
           --arg  repo "${{ github.repository }}" \
-          --argjson pr  ${{ github.event.pull_request.number }} \
+          --argjson pr  "${_PR_NUM_RESOLVED}" \
           --arg  sha  "$HEAD_SHA" \
           --arg  id   "${INSTALL_ID:-0}" \
           '{repo: $repo, pr: $pr, head_sha: $sha, installation_id: (if $id == "" then 0 else ($id | tonumber) end)}')
 
-        ANALYSIS_TOKEN=$(curl -sf -X POST \
+        ANALYSIS_TOKEN=$(curl "${GOVERNOR_CURL_OPTS[@]}" --retry 3 --retry-delay 10 -X POST \
           "${GOVERNOR}/v1/analysis-token" \
           -H "Content-Type: application/json" \
           -d "$TOKEN_PAYLOAD" | jq -er '.token')
 
-        "$JANITOR_BIN" bounce . \
-          --patch         .janitor-pr.patch \
-          --pr-number     "${{ github.event.pull_request.number }}" \
+        timeout "${JANITOR_TIMEOUT_SECONDS}s" "$JANITOR_BIN" "${BOUNCE_ARGS[@]}" \
           --governor-url  "${GOVERNOR}" \
-          --analysis-token "$ANALYSIS_TOKEN" \
-          --head-sha      "$HEAD_SHA" \
-          ${{ inputs.deep_scan == 'true' && '--deep-scan' || '' }}
+          --analysis-token "$ANALYSIS_TOKEN"
 
     # Step 6 — Publish Integrity Dashboard to GitHub Actions Step Summary.
     #

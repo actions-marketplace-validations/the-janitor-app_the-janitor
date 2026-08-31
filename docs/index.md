@@ -11,20 +11,40 @@ hide:
 
 # The Janitor
 
-**v10.2.0-rc.1 — The Mathematical Firewall Against Autonomous AI. 23 Grammars. IFDS + Z3 SMT + AEG. Dual-PQC Attestation. SLSA Level 4 Reproducible Builds. Zero-Upload. On-Device.**
+**v10.2.11 — Rust static-analysis security research platform. 23 grammars. IFDS + Z3 SMT. Kani proof obligations. Exploit-witness synthesis. Post-quantum provenance. Zero-upload local execution.**
 
 ---
 
-> **Sonar finds style violations.**
-> **The Janitor enforces structural integrity.**
+> **Research question:** can static analysis turn AI-assisted code review from prose trust into reproducible proof obligations?
 
 > *82% of open Godot Engine pull requests contain no issue link. 20% introduce language antipatterns. Zero comment scanners caught it. The Janitor did — across 50 live PRs, in under 90 seconds.*
 
 ---
 
-## THE ENFORCEMENT LAYER
+## Research Questions and Safety Outcomes
 
-The Janitor is not a linter. It is not a SAST scanner. It is a **structural enforcement layer** that runs on your hardware, in your pipeline, on every pull request — before the merge button is available. The Janitor is the only deterministic defense against 'Mythos-class' AI agents, mathematically verifying intent before code enters the repository. Looking ahead, our decadal roadmap pioneers Zero-Knowledge AST proofs and Labyrinth Deception to neutralize adversarial agents at the structural level.
+The Janitor is an active Rust static-analysis research platform studying whether IFDS dataflow, Z3 path feasibility, Kani proof obligations, exploit-witness synthesis, and post-quantum provenance can make security triage reproducible under AI-assisted development. The research outcome is a local, zero-upload pipeline that classifies findings by proof strength before they reach audit ledgers or human review.
+
+The empirical method is deterministic: run the same detector corpus across real repositories, preserve proof-class decisions as structured findings, verify critical predicates with Kani, and attach reproducible command evidence where a vulnerability claim is strong enough to leave research triage. The project is currently best understood as a research artifact and collaboration surface, not a procurement-ready enterprise product.
+
+## Adversarial Robustness and Tool-Intent Safety
+
+The Janitor treats prompt injection, MCP/tool dispatch, agentic origin, and untrusted-context transposition as security research surfaces. Detectors attach deterministic proof obligations for prompt/tool non-interference, confused-deputy dispatch, agentic-origin classification, and retrieval-context trust so tool-intent claims are evaluated by reproducible evidence rather than narrative confidence.
+
+## Cloud Reproducibility Track
+
+Janitor evidence can be reproduced in GitHub Actions and mapped onto Google Cloud Build and Artifact Registry provenance without uploading source code to a hosted scanner. A reproducibility run emits local findings, proof-class decisions, SARIF, and provenance metadata that can be mirrored into Cloud Build attestations or Artifact Registry records while keeping repository contents inside the operator-controlled build environment.
+
+## Research Foundation
+
+The Janitor is an active security research platform spanning four technical frontiers:
+
+- **Interprocedural Taint Analysis (IFDS)** — context-sensitive dataflow across 14 languages with sanitizer-registry suppression and Z3 SMT path-feasibility refinement.
+- **Formal Verification (Kani + Z3)** — every security-critical predicate ships with a `#[kani::proof]` harness proving absence of panics and integer overflow across all symbolic inputs. Z3-backed exploit witnesses synthesize `curl`-form reproduction commands from model-extracted payloads.
+- **Post-Quantum Provenance (ML-DSA-65 + SHA-384)** — all findings are sealed into SLSA Level 4 `DecisionCapsule` records with dual-PQC attestation, verifiable offline without source upload.
+- **ZK AST Attestation (roadmap)** — in-progress Halo2/Plonky3 circuit design for absence-of-bad-pattern proofs, enabling FedRAMP High and DoD IL6 compliance attestation without revealing source.
+
+Peer-reviewed collaborations and research partnerships welcome. Contact: reghramm@gmail.com.
 
 ## Why Not CodeQL, Snyk, or SonarQube?
 
@@ -93,7 +113,7 @@ Commit-status publishing for **GitHub**, **GitLab**, and **Azure DevOps** — au
 
 ![Janitor Sentinel Demo](assets/sentinel_demo.webp)
 
-*Janitor Sentinel automatically downgrades vetoes when it detects safe patterns (e.g., Dependabot).*
+*Janitor Sentinel exempts trusted automation from issue-link penalties; dependency bumps still undergo full structural analysis.*
 
 ### Datacenter Sustainability
 
@@ -361,6 +381,28 @@ Includes all Sovereign capabilities, plus:
 - **SOC 2 Audit Support** — direct engineering integration for compliance
 
 [**Contact sales → sales@thejanitor.app**](mailto:sales@thejanitor.app)
+
+---
+
+## VERIFIABLE SECURITY POSTURE
+
+**Claims without evidence are marketing. Evidence without claims is a data dump. Below is both.**
+
+| Claim | Evidence |
+|:------|:---------|
+| CI is green | [GitHub Actions — main branch](https://github.com/janitor-security/the-janitor/actions) |
+| Release binary is tamper-evident | Every release ships a `.sha384` sidecar + ML-DSA-65 `.sig`; verify with `janitor verify-asset` |
+| SLSA Level 4 reproducible builds | Dual-build Docker comparison on every release — see [release workflow](https://github.com/janitor-security/the-janitor/blob/main/.github/workflows/janitor.yml) |
+| Dependency CVEs tracked | [Dependabot PRs](https://github.com/janitor-security/the-janitor/pulls?q=is%3Apr+is%3Aopen+author%3Aapp%2Fdependabot) — auto-surfaced, triaged on each release cycle |
+| OpenSSF Scorecard | Runs on every push — see [scorecard.yml](https://github.com/janitor-security/the-janitor/blob/main/.github/workflows/scorecard.yml) |
+| Workflow permission rationale | [Security posture note](security.md) — enumerates every non-read GitHub token scope and why it exists |
+| Security disclosure | [security@thejanitor.app](mailto:security@thejanitor.app) — coordinated, no-pressure, 90-day max window |
+
+**What is certified today**: BUSL-1.1 licensed open-source binary. Dual-PQC-signed CBOMs. SHA-384 ledger. SLSA Level 4 build provenance. OpenSSF Scorecard continuous monitoring.
+
+**What is a roadmap item**: SOC 2 Type II audit (not yet completed). FedRAMP Moderate ATO (targeting 2027; not authorized today).
+
+**Enterprise pilots and Anthropic grant inquiries**: [security@thejanitor.app](mailto:security@thejanitor.app). Include your use case, deployment environment, and compliance requirements. Pilot licenses (30-day, full Industrial Tier) are available for qualifying evaluations.
 
 ---
 

@@ -21,8 +21,10 @@ pub struct EndpointSurface {
     pub line: Option<u32>,
 }
 
+/// Internal controller match with handler-span metadata used to bind findings
+/// to supported ingress surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EndpointSurfaceMatch {
+pub struct EndpointSurfaceMatch {
     pub surface: EndpointSurface,
     pub handler_name: Option<String>,
     pub start_line: u32,
@@ -47,6 +49,40 @@ pub fn extract_controller_surface(tree: &Tree, lang: &str, source: &[u8]) -> Vec
         .collect()
 }
 
+/// Parse source text and extract endpoint surfaces for a supported controller file.
+pub fn extract_controller_surface_for_file(
+    lang: &str,
+    source: &[u8],
+    file: String,
+) -> Vec<EndpointSurface> {
+    extract_controller_surface_matches_for_file(lang, source, file)
+        .into_iter()
+        .map(|entry| entry.surface)
+        .collect()
+}
+
+/// Parse source text and retain handler span metadata for supported controller files.
+pub fn extract_controller_surface_matches_for_file(
+    lang: &str,
+    source: &[u8],
+    file: String,
+) -> Vec<EndpointSurfaceMatch> {
+    let language = match lang {
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "py" => tree_sitter_python::LANGUAGE.into(),
+        "js" | "jsx" | "ts" | "tsx" => tree_sitter_javascript::LANGUAGE.into(),
+        _ => return Vec::new(),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    extract_controller_surface_with_file(&tree, lang, source, file)
+}
+
 pub(crate) fn extract_controller_surface_with_file(
     tree: &Tree,
     lang: &str,
@@ -65,15 +101,15 @@ pub(crate) fn extract_controller_surface_with_file(
 pub fn extract_frontend_routes_from_source(
     lang: &str,
     source: &[u8],
-    file: String,
+    file: &str,
 ) -> Vec<FrontendRoute> {
     if !matches!(lang, "js" | "jsx" | "ts" | "tsx") {
         return Vec::new();
     }
     let text = std::str::from_utf8(source).unwrap_or("");
-    let imports = collect_js_imports(text, &file);
-    let mut routes = extract_react_router_routes(text, source, &file, &imports);
-    routes.extend(extract_vue_router_routes(text, source, &file, &imports));
+    let imports = collect_js_imports(text, file);
+    let mut routes = extract_react_router_routes(text, source, file, &imports);
+    routes.extend(extract_vue_router_routes(text, source, file, &imports));
 
     let mut deduped = Vec::with_capacity(routes.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -121,7 +157,7 @@ pub fn match_frontend_route_for_file<'a>(
     })
 }
 
-pub(crate) fn match_surface_for_witness<'a>(
+pub fn match_surface_for_witness<'a>(
     surfaces: &'a [EndpointSurfaceMatch],
     source_function: &str,
     line: Option<u32>,
@@ -498,7 +534,12 @@ fn extract_vue_router_routes(
             search_from = start + 4;
             continue;
         };
-        let window_end = tail.find('}').unwrap_or(tail.len()).min(256);
+        let raw_end = tail.find('}').unwrap_or(tail.len()).min(256);
+        // Walk back to the nearest valid UTF-8 char boundary.
+        let window_end = (0..=raw_end)
+            .rev()
+            .find(|&i| tail.is_char_boundary(i))
+            .unwrap_or(0);
         let window = &tail[..window_end];
         let component = extract_vue_component_name(window);
         let component_file = if let Some(dynamic_import) = extract_dynamic_import_path(window) {
@@ -1082,8 +1123,7 @@ export function Router() {
     return <Route path="/login" element={<Captcha />} />;
 }
 "#;
-        let routes =
-            extract_frontend_routes_from_source("tsx", source, "src/router.tsx".to_string());
+        let routes = extract_frontend_routes_from_source("tsx", source, "src/router.tsx");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].route_path, "/login");
         assert_eq!(routes[0].component.as_deref(), Some("Captcha"));
@@ -1099,7 +1139,7 @@ const routes = [
   { path: "/login", component: LoginView }
 ];
 "#;
-        let routes = extract_frontend_routes_from_source("ts", source, "src/router.ts".to_string());
+        let routes = extract_frontend_routes_from_source("ts", source, "src/router.ts");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].route_path, "/login");
         assert_eq!(routes[0].component.as_deref(), Some("LoginView"));

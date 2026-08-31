@@ -46,6 +46,11 @@ AST walk), and TSX/JSX (dangerouslySetInnerHTML attribute walk).
 GraphQL/AsyncAPI Trust Boundary Extraction, and Web3 EVM Invariant Checking are
 first-class enforcement surfaces, not roadmap placeholders.
 
+**Pilot evaluation surface**: security reviews should measure the architecture by
+source-retention guarantees, deterministic proof summaries, CI terminality, and
+bounded memory behavior. The enterprise/FedRAMP path is therefore an evidence
+pack generated from existing controls, not a separate public grant workflow.
+
 Grammar library: `tree-sitter 0.26` (workspace pinned).
 
 ### Foundational Crates & Mathematical Models
@@ -502,6 +507,11 @@ Architecture Inversion (Steps 1–4 complete):
 New env var: `GOVERNOR_INVERT_MODE=1` — gates all inversion behaviour in the Governor. Default: `0` (legacy clone path).
 New CLI flags: `janitor bounce --report-url <url> --analysis-token <jwt>`
 New `AppState` fields: `invert_mode: bool`, `token_rate_limit: DashMap`, `pending_checks: DashMap`
+
+**Current deployment boundary**: the public GitHub Action and Janitor Sentinel
+path use runner-side analysis plus Governor score reporting. References to the
+legacy clone path in this document are implementation-history notes, not the
+recommended deployment model.
 
 ---
 

@@ -76,10 +76,7 @@
 //! memory observer from the scanning hot-path: a rayon pool processing 100
 //! PRs/sec issues ≤ 10 sysinfo reads/sec instead of 100.
 
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    OnceLock,
-};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use sysinfo::System;
@@ -317,21 +314,7 @@ impl SystemHeart {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
-        // Throttled refresh — call sysinfo only when the window has elapsed.
-        // The SMA ring buffer is updated only on actual refreshes so every
-        // sample in the history represents a distinct OS observation.
-        if now.duration_since(g.last_refresh) >= REFRESH_THROTTLE {
-            g.sys.refresh_memory();
-            g.cached_total = g.sys.total_memory();
-            g.cached_used = g.sys.used_memory();
-            g.last_refresh = now;
-            // Copy before the push to avoid a simultaneous mut/imm borrow of `g`.
-            let snapshot_used = g.cached_used;
-            g.history.push(Sample {
-                at: now,
-                used: snapshot_used,
-            });
-        }
+        refresh_cache_if_needed(&mut g, now);
 
         let total = g.cached_total;
         if total == 0 {
@@ -363,28 +346,14 @@ impl SystemHeart {
         };
 
         // Percentage-driven base pulse.
-        let base = if pct > 90.0 {
-            Pulse::Stop
-        } else if pct > constrict_threshold {
-            Pulse::Constrict
-        } else {
-            Pulse::Flow
-        };
+        let base = classify_pressure_pct(pct, constrict_threshold);
 
         // Velocity override: a rapid positive allocation surge escalates to
         // at least Constrict even when the SMA is within normal bounds.
         // Negative velocity (memory being freed) is intentionally ignored.
         // The velocity gate cannot produce Stop — that requires the SMA to
         // cross the 90 % hard ceiling.
-        if base == Pulse::Flow {
-            if let Some(v) = velocity {
-                if v > HIGH_VELOCITY_BYTES_PER_SEC {
-                    return Pulse::Constrict;
-                }
-            }
-        }
-
-        base
+        apply_velocity_override(base, velocity)
     }
 
     /// Sample memory pressure under active Swarm conditions and return the
@@ -430,19 +399,7 @@ impl SystemHeart {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
-        // Same throttled-refresh logic as beat() — the Swarm variant shares
-        // the Inner cache so both paths benefit from the same deduplication.
-        if now.duration_since(g.last_refresh) >= REFRESH_THROTTLE {
-            g.sys.refresh_memory();
-            g.cached_total = g.sys.total_memory();
-            g.cached_used = g.sys.used_memory();
-            g.last_refresh = now;
-            let snapshot_used = g.cached_used;
-            g.history.push(Sample {
-                at: now,
-                used: snapshot_used,
-            });
-        }
+        refresh_cache_if_needed(&mut g, now);
 
         let total = g.cached_total;
         if total == 0 {
@@ -457,24 +414,44 @@ impl SystemHeart {
         // so that the existing static thresholds fire at a lower real RAM%.
         let pct = effective_used / total as f64 * 100.0 * multiplier;
 
-        let base = if pct > 90.0 {
-            Pulse::Stop
-        } else if pct > 75.0 {
-            Pulse::Constrict
-        } else {
-            Pulse::Flow
-        };
-
-        if base == Pulse::Flow {
-            if let Some(v) = velocity {
-                if v > HIGH_VELOCITY_BYTES_PER_SEC {
-                    return Pulse::Constrict;
-                }
-            }
-        }
-
-        base
+        let base = classify_pressure_pct(pct, CONSTRICT_THRESHOLD_NORMAL);
+        apply_velocity_override(base, velocity)
     }
+}
+
+fn refresh_cache_if_needed(g: &mut std::sync::MutexGuard<'_, Inner>, now: Instant) {
+    if now.duration_since(g.last_refresh) < REFRESH_THROTTLE {
+        return;
+    }
+
+    g.sys.refresh_memory();
+    g.cached_total = g.sys.total_memory();
+    g.cached_used = g.sys.used_memory();
+    g.last_refresh = now;
+    let snapshot_used = g.cached_used;
+    g.history.push(Sample {
+        at: now,
+        used: snapshot_used,
+    });
+}
+
+#[inline]
+fn classify_pressure_pct(pct: f64, constrict_threshold: f64) -> Pulse {
+    if pct > 90.0 {
+        Pulse::Stop
+    } else if pct > constrict_threshold {
+        Pulse::Constrict
+    } else {
+        Pulse::Flow
+    }
+}
+
+#[inline]
+fn apply_velocity_override(base: Pulse, velocity: Option<f64>) -> Pulse {
+    if base == Pulse::Flow && velocity.is_some_and(|value| value > HIGH_VELOCITY_BYTES_PER_SEC) {
+        return Pulse::Constrict;
+    }
+    base
 }
 
 impl Default for SystemHeart {
@@ -609,7 +586,7 @@ static GLOBAL_PULSE: AtomicU8 = AtomicU8::new(0);
 
 /// One-time sentinel that ensures the background heart thread is started
 /// at most once regardless of how many callers invoke [`start_background_heart`].
-static HEART_STARTED: OnceLock<()> = OnceLock::new();
+static HEART_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn pulse_to_u8(p: Pulse) -> u8 {
@@ -650,19 +627,27 @@ pub fn global_pulse() -> Pulse {
 ///
 /// The thread is named `physarum-heart` and runs until process exit.
 pub fn start_background_heart() {
-    HEART_STARTED.get_or_init(|| {
-        std::thread::Builder::new()
-            .name("physarum-heart".to_owned())
-            .spawn(|| {
-                let heart = SystemHeart::new();
-                loop {
-                    let pulse = heart.beat();
-                    GLOBAL_PULSE.store(pulse_to_u8(pulse), Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(MELANIN_REFRESH_MS));
-                }
-            })
-            .expect("physarum: failed to spawn background heart thread");
-    });
+    if HEART_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("physarum-heart".to_owned())
+        .spawn(|| {
+            let heart = SystemHeart::new();
+            loop {
+                let pulse = heart.beat();
+                GLOBAL_PULSE.store(pulse_to_u8(pulse), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(MELANIN_REFRESH_MS));
+            }
+        })
+    {
+        HEART_STARTED.store(false, Ordering::Release);
+        eprintln!("physarum: failed to spawn background heart thread: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,21 +670,25 @@ mod tests {
 
     #[test]
     fn test_pulse_thresholds() {
-        // Verify percentage-driven threshold logic directly.
-        let classify = |pct: f64| -> Pulse {
-            if pct > 90.0 {
-                Pulse::Stop
-            } else if pct > 75.0 {
-                Pulse::Constrict
-            } else {
-                Pulse::Flow
-            }
-        };
-        assert_eq!(classify(50.0), Pulse::Flow);
-        assert_eq!(classify(75.0), Pulse::Flow); // boundary — inclusive
-        assert_eq!(classify(75.1), Pulse::Constrict);
-        assert_eq!(classify(90.0), Pulse::Constrict); // boundary — inclusive
-        assert_eq!(classify(90.1), Pulse::Stop);
+        assert_eq!(classify_pressure_pct(50.0, 75.0), Pulse::Flow);
+        assert_eq!(classify_pressure_pct(75.0, 75.0), Pulse::Flow);
+        assert_eq!(classify_pressure_pct(75.1, 75.0), Pulse::Constrict);
+        assert_eq!(classify_pressure_pct(90.0, 75.0), Pulse::Constrict);
+        assert_eq!(classify_pressure_pct(90.1, 75.0), Pulse::Stop);
+    }
+
+    #[test]
+    fn test_velocity_override_only_escalates_flow() {
+        let burst = Some(HIGH_VELOCITY_BYTES_PER_SEC + 1.0);
+        assert_eq!(
+            apply_velocity_override(Pulse::Flow, burst),
+            Pulse::Constrict
+        );
+        assert_eq!(
+            apply_velocity_override(Pulse::Constrict, burst),
+            Pulse::Constrict
+        );
+        assert_eq!(apply_velocity_override(Pulse::Stop, burst), Pulse::Stop);
     }
 
     #[test]
@@ -1038,7 +1027,7 @@ mod tests {
     #[test]
     fn test_start_background_heart_idempotent() {
         // Calling start_background_heart multiple times must not panic or
-        // spawn extra threads — the OnceLock guarantees single execution.
+        // spawn extra threads.
         start_background_heart();
         start_background_heart();
         start_background_heart();

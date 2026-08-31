@@ -492,6 +492,20 @@ resource \"aws_s3_bucket_acl\" \"private\" {
         must_intercept: true,
         desc_fragment: Some("obfuscated_payload_execution"),
     },
+    Entry {
+        name: "TS/vector filter predicate polymorphism — INTERCEPT",
+        lang: "ts",
+        source: b"async function answer(req) { const filter = JSON.parse(req.query.filter); const results = await pinecone.query({ vector: embed(req.body.prompt), filter, topK: 6 }); return client.chat.completions.create({ messages: [{ role: 'user', content: results.matches[0].metadata.page_content }] }); }\n",
+        must_intercept: true,
+        desc_fragment: Some("vector_filter_polymorphism"),
+    },
+    Entry {
+        name: "TS/non-vector API query filter — SAFE",
+        lang: "ts",
+        source: b"async function list(req) { const filter = JSON.parse(req.query.filter); return db.query('select users', filter); }\n",
+        must_intercept: false,
+        desc_fragment: None,
+    },
 
     // ── Supply Chain Integrity ────────────────────────────────────────────
     Entry {
@@ -1516,7 +1530,7 @@ pub fn run_gallery() -> bool {
 
     for entry in GALLERY {
         let parsed = ParsedUnit::unparsed(entry.source);
-        let findings = find_slop(entry.lang, &parsed);
+        let findings = find_slop(entry.lang, &parsed, "");
         let intercepted = !findings.is_empty();
 
         let ok = if entry.must_intercept {
@@ -2623,7 +2637,7 @@ index 1111111..2222222 100644
                 // exercising the timeout path.  find_slop must not panic regardless
                 // of input content.
                 let parsed = forge::slop_hunter::ParsedUnit::unparsed(&bytes);
-                let _ = find_slop(lang, &parsed);
+                let _ = find_slop(lang, &parsed, "");
                 let elapsed = start.elapsed();
 
                 assert!(

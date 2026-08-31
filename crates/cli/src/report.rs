@@ -3,7 +3,7 @@
 //! Reads `.janitor/bounce_log.ndjson` — a newline-delimited JSON log appended
 //! by each `janitor bounce` invocation — and produces three analytical sections:
 //!
-//! 1. **Slop Top 50** — PRs ranked by composite [`SlopScore`].
+//! 1. **Slop Top 50** — PRs ranked by composite `SlopScore`.
 //! 2. **Structural Clones** — near-duplicate PR pairs detected via 64-hash
 //!    MinHash LSH (Jaccard ≥ 0.70).
 //! 3. **Zombie Dependencies** — PRs that introduced packages declared in a
@@ -15,10 +15,13 @@
 //! Output formats: `markdown` (default) and `json`.
 
 use hmac::{Hmac, KeyInit, Mac};
+use janitor_gov::compartment::{enforce_flow, Clearance};
+use reaper::transparency_log::TransparencyLog;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use vault::fips_boundary::{CryptoAlgorithm, CryptoBoundary, SecurityPurpose};
 
 // ---------------------------------------------------------------------------
 // ROI Constants — Workslop Triage Tax
@@ -41,6 +44,23 @@ pub const CRITICAL_THREAT_AVERTED_RERUNS: f64 = 5.0;
 /// or the `--report-url` CLI flag.  This default guarantees zero unintentional
 /// egress from air-gapped or regulated environments.
 pub const DEFAULT_GOVERNOR_URL: &str = "http://127.0.0.1:8080";
+
+fn configured_source_clearance() -> anyhow::Result<Clearance> {
+    Clearance::from_optional_env(std::env::var("JANITOR_DATA_CLEARANCE").ok())
+        .map_err(anyhow::Error::from)
+}
+
+fn configured_webhook_clearance() -> anyhow::Result<Clearance> {
+    Clearance::from_optional_env(std::env::var("JANITOR_WEBHOOK_CLEARANCE").ok())
+        .map_err(anyhow::Error::from)
+}
+
+fn enforce_webhook_export_flow() -> anyhow::Result<()> {
+    let src = configured_source_clearance()?;
+    let dst = configured_webhook_clearance()?;
+    enforce_flow(src, dst)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InclusionProof {
@@ -124,6 +144,15 @@ fn resolve_webhook_secret(cfg: &common::policy::WebhookConfig) -> String {
 
 fn sign_webhook_payload(secret: &str, payload: &str) -> String {
     if secret.is_empty() {
+        return String::new();
+    }
+    if CryptoBoundary::record_operation(
+        "cli::report::sign_webhook_payload",
+        CryptoAlgorithm::HmacSha256,
+        SecurityPurpose::TransportIntegrity,
+    )
+    .is_err()
+    {
         return String::new();
     }
 
@@ -217,6 +246,10 @@ pub fn fire_webhook_if_configured(entry: &BounceLogEntry, policy: &common::polic
     if !cfg.should_fire(is_critical, is_necrotic) {
         return;
     }
+    if let Err(err) = enforce_webhook_export_flow() {
+        eprintln!("{err}");
+        return;
+    }
 
     // ── Resolve secret ───────────────────────────────────────────────────
     let secret = resolve_webhook_secret(cfg);
@@ -257,6 +290,10 @@ pub fn emit_lifecycle_webhook(
 ) {
     let cfg = &policy.webhook;
     if cfg.url.is_empty() || !cfg.lifecycle_events {
+        return;
+    }
+    if let Err(err) = enforce_webhook_export_flow() {
+        eprintln!("{err}");
         return;
     }
 
@@ -317,6 +354,10 @@ pub fn emit_lifecycle_webhook(
 pub fn emit_sbom_drift_webhook(new_packages: &[String], policy: &common::policy::JanitorPolicy) {
     let cfg = &policy.webhook;
     if cfg.url.is_empty() {
+        return;
+    }
+    if let Err(err) = enforce_webhook_export_flow() {
+        eprintln!("{err}");
         return;
     }
     if !cfg.events.is_empty() && !cfg.events.iter().any(|e| e == "sbom_drift") {
@@ -574,7 +615,7 @@ pub struct BounceLogEntry {
     /// Empty for git-native bounces and pre-v6.9 log entries.
     #[serde(default)]
     pub comment_violations: Vec<String>,
-    /// MinHash sketch — 64 `u64` values — for clone detection via [`LshIndex`].
+    /// MinHash sketch — 64 `u64` values — for clone detection via `LshIndex`.
     ///
     /// Computed from raw patch bytes (patch mode) or the deterministic merkle key
     /// (git-native mode). Empty for log entries written before this field was added.
@@ -1037,7 +1078,7 @@ pub fn load_bounce_log(janitor_dir: &Path) -> Vec<BounceLogEntry> {
 /// Appends one entry as a JSON line to `.janitor/bounce_log.ndjson`.
 ///
 /// Creates the janitor directory and log file if absent.
-/// Calls [`File::sync_all`] after writing to flush the OS page cache to physical
+/// Calls `File::sync_all` after writing to flush the OS page cache to physical
 /// disk before returning — guarantees the entry survives a SIGKILL of the parent
 /// shell script between iterations.
 /// Emits a diagnostic to stderr on any I/O failure so silent log loss is detectable.
@@ -1082,6 +1123,14 @@ fn append_log_line<T: Serialize>(janitor_dir: &Path, event: &T) {
             // write(2) returned successfully.
             if let Err(e) = f.sync_all() {
                 eprintln!("janitor: sync_all on {} failed: {e}", log_path.display());
+                return;
+            }
+            let transparency_path = janitor_dir.join("transparency_log.ndjson");
+            if let Err(e) = TransparencyLog::append_leaf(&transparency_path, line.as_bytes()) {
+                eprintln!(
+                    "janitor: transparency append to {} failed: {e}",
+                    transparency_path.display()
+                );
             }
         }
         Err(e) => {
@@ -2157,7 +2206,7 @@ pub fn render_json(data: &ReportData, repo_name: &str) -> serde_json::Value {
 
 /// A single dead symbol entry for scan-mode reports.
 ///
-/// Converted from [`anatomist::Entity`] by [`cmd_report`] before rendering,
+/// Converted from `anatomist::Entity` by `cmd_report` before rendering,
 /// so this module remains free of an `anatomist` dependency.
 pub struct DeadSymbolEntry {
     /// Fully-qualified symbol name (e.g. `module::Class::method`).

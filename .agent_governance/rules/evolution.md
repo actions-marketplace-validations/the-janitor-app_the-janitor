@@ -16,6 +16,28 @@ Follow `.agent_governance/rules/8gb-law.md`: pure Rust, zero-copy,
 low-memory AST/IFDS first. Never recommend P2-4 Tier 3, JVM subprocesses, or
 local massive ML inference as `[NEXT RECOMMENDED ACTION]`.
 
+## Release Parity Law
+
+You are mathematically forbidden from updating `README.md`, `docs/index.md`, or
+`docs/architecture.md` during feature sprints to conserve context tokens. These
+files MUST only be updated during a sprint that explicitly cuts a Release
+Candidate (RC) or Major Version.
+
+## Ledger Hydration Law
+
+When reviewing low-yield or candidate ledgers, you MUST read the
+`R&D Follow-Up` columns in `tools/campaign/CANDIDATE_LEDGER.md` and
+`tools/campaign/LOW_YIELD_LEDGER.md` during EVERY sprint. If an R&D task is
+listed but does not already have a corresponding strict P-tier entry in
+`.INNOVATION_LOG.md`, you MUST elevate it into a formal P-tier entry in the log
+immediately.
+
+## Git Sync Law
+
+You must execute `git push origin main` after every successful local commit in a
+sprint, UNLESS explicitly instructed otherwise by the operator. The local and
+remote state must remain synchronized to trigger CI/CD pipelines.
+
 ## Autonomous Ideation Law
 
 When reviewing `janitor hunt` output, any report text showing `Unknown / Source
@@ -27,6 +49,67 @@ trigger. Immediately either:
    in Rust; or
 2. Append a detailed actionable `P1` or `P2` proposal to `.INNOVATION_LOG.md`
    naming the solver/template required to eliminate the human intervention.
+
+## Architectural Oracle Law
+
+When writing `[NEXT RECOMMENDED ACTION]`, you MUST dynamically inspect legacy
+infrastructure with `rg` before emitting the prompt. The minimum scan set is:
+
+- `crates/cli/src/daemon.rs`
+- `crates/common/src/physarum.rs`
+- `action.yml`
+
+The resulting prompt MUST include an **Architectural Oracle Tip** that:
+
+1. Names a concrete drift pocket, bloat seam, or forgotten feature discovered
+   in that scan.
+2. Provides one precise, token-efficient command that modernizes or prunes the
+   legacy surface in the next sprint.
+3. Optimizes engine velocity without appending noise to bounty or backlog
+   ledgers.
+
+Generic "clean things up" advice is a governance violation. The tip must be
+derived from the live scan, not memory.
+
+## Autonomous Modulator Law
+
+Final directive summaries now have two distinct intelligence channels:
+
+1. `[NEXT RECOMMENDED ACTION]` is reserved for the *next agent* and must remain
+   a copy-pasteable Sovereign Directive prompt.
+2. `[OPERATOR INTELLIGENCE]` is reserved for the *human operator* and must NOT
+   be framed as an agent prompt.
+
+The `[OPERATOR INTELLIGENCE]` section MUST include an **Entropy Modulator Tip**
+derived from the last 3 sprint entries in `docs/CHANGELOG.md`.
+
+Entropy Modulator requirements:
+
+- If the last 3 sprints concentrated on Web/AI surfaces, the tip must analyze
+  Systems/CLI/Build infrastructure.
+- If the last 3 sprints concentrated on Systems/CLI/Build infrastructure, the
+  tip must analyze Web/AI surfaces.
+- The tip must identify one concrete refactor, token-efficiency improvement, or
+  procedural bottleneck the human should address.
+- The tip must be concise, operational, and explicitly human-directed.
+
+Generic motivation, trend commentary, or restating the agent prompt is a
+governance violation.
+
+## Distinct-Target Hydration Law
+
+When selecting the next 3 GitHub hunt targets from
+`tools/campaign/target_ledger.json`, you MUST enforce organization/project
+diversity.
+
+Hard rules:
+
+1. The 3 selected targets must come from 3 distinct organizations or projects.
+2. Do NOT select multiple repository variants from the same family in the same
+   sprint (for example `org/repo`, `org/repo-docs`, and `org/repo-client`).
+3. If the next raw ledger entries violate this law, skip forward until 3
+   distinct organizations/projects are found, then record the actual hydrated
+   targets in the ledger outcome notes.
 
 ## Gate hierarchy (prefer higher tiers)
 
@@ -86,21 +169,41 @@ the finding is absent from the output before closing.
 The sole exception: `security:credential_leak` is always billable regardless of
 path — a secret in a repo is a secret in a repo.
 
+## Ledger Synchronization Law
+
+Whenever a structural AST guard is implemented that suppresses a previously
+recorded vulnerability class, you MUST proactively open
+`tools/campaign/BOUNTY_LEDGER.md` and physically DELETE the obsolete rows
+corresponding to the now-disproven findings. The ledger is an active
+monetization surface, not an archaeological record of false positives.
+
 ## Bounty Extraction Law
 
-When executing `janitor hunt`, you must review the output for weaponized findings.
-A finding is weaponized ONLY if it possesses a concrete reproduction payload,
-`repro_cmd`, or generated HTML harness — NOT `Pending`.
+When executing `janitor hunt`, you must review the output through the
+Tri-Ledger Funnel. A finding is weaponized ONLY if it possesses a concrete
+reproduction payload, `repro_cmd`, or generated HTML harness — NOT `Pending`.
 
-For every weaponized finding, you MUST:
+For every finding, you MUST:
 A. Cross-reference the finding against its parent program's rules in
    `tools/campaign/targets/<program>_targets.md`.
 B. Verify the target is strictly IN SCOPE.
 C. Extract the estimated payout for the finding's severity.
-D. Append a structured entry to `tools/campaign/BOUNTY_LEDGER.md` detailing:
+D. Route the structured row to exactly one ledger:
+   - `tools/campaign/BOUNTY_LEDGER.md` for `Approval % >= 85` AND a concrete
+     autonomous payload (`repro_cmd` or HTML harness). These rows are ready for
+     direct submission.
+   - `tools/campaign/CANDIDATE_LEDGER.md` for `Approval % >= 10 && < 85`.
+     These rows are valid findings missing a fully autonomous payload or
+     requiring manual verification. The row MUST record the exact
+     `Exploitation Strategy` or mathematical proof gap that blocked an 85%
+     rating.
+   - `tools/campaign/LOW_YIELD_LEDGER.md` for `Approval % < 10`. These rows are
+     informational, test-only, or currently unexploitable and must preserve the
+     reason routed plus the R&D follow-up.
+E. Preserve the canonical schema fields:
    `[Date]`, `[Target URL/Repo]`, `[Vulnerability Class]`, `[Severity]`,
-   `[Expected Payout]`, `[Estimated Approval % (>85% if payload exists)]`,
-   `[Exact Repro Command]`, and `[Remediation / Exploitation Strategy]`.
+   `[Expected Payout]`, `[Estimated Approval %]`, `[Exact Repro Command]`, and
+   `[Remediation / Exploitation Strategy]`.
 
 ### Lattice-Gap Innovation Loop
 
@@ -125,16 +228,19 @@ logging any finding to the Bounty Ledger.
   server-side SSRF — it is a client-side HTTP call blocked by SOP/CORS. The
   finding does NOT constitute an SSRF bounty unless a server-side execution path
   (SSR, Next.js API route, service worker with `no-cors`, or Node.js backend) can
-  be demonstrated. Set `Estimated Approval % < 10%` and append the elevation
-  path, or drop the entry entirely if no server-side path exists.
+  be demonstrated. Set `Estimated Approval % < 10%` and route the entry to
+  `tools/campaign/LOW_YIELD_LEDGER.md` with the missing server-side elevation
+  proof recorded as the R&D follow-up.
 - If a finding is **Self-XSS** (victim must paste a payload into their own browser
   console or input field with no third-party trigger), set `Estimated Approval % < 10%`.
 
-For every entry with `Approval % < 10%`, you MUST append an
-`Exploitation Strategy` column entry describing EXACTLY how to elevate the finding
-to >85% (e.g., "find an unauthenticated path to the config file", "find a
-server-side Next.js API route that calls this same SDK method"), or DELETE the
-entry entirely if no viable elevation path exists.
+For every entry with `Approval % < 10%`, you MUST route the row to
+`tools/campaign/LOW_YIELD_LEDGER.md` instead of deleting it. The low-yield row
+must preserve the target, finding class, approval estimate, reason routed, and
+R&D follow-up so Omni-Audits can mine it for future AEG templates or AST
+suppressions. `tools/campaign/BOUNTY_LEDGER.md` remains reserved for findings
+with `Approval % >= 85%`, and `tools/campaign/CANDIDATE_LEDGER.md` is reserved
+for findings in the `10%..84%` approval band.
 
 ### Schema Taint Verification Law (Sprint Batch 95)
 
@@ -197,13 +303,13 @@ finding remains unweaponized until a defensive proof can be produced.
 
 ### Dual-Ledger Mandate (Sprint Batch 96)
 
-Whenever a finding is logged to `BOUNTY_LEDGER.md` with an `Approval % < 85%`
+Whenever a finding is logged to `CANDIDATE_LEDGER.md` with an `Approval % < 85%`
 due to a **missing engine capability** (e.g., Schema Taint Verification, React
 Context loss, cross-file sanitizer propagation), you MUST perform a
 **Dual-Ledger action**:
 
-1. Document the manual `Exploitation Strategy` in the Bounty Ledger (existing
-   Bounty Extraction Law obligation).
+1. Document the manual `Exploitation Strategy` in the Candidate Ledger
+   (existing Bounty Extraction Law obligation).
 2. **Immediately** author a corresponding P-tier architectural proposal in
    `.INNOVATION_LOG.md` designed to automate that manual strategy. The proposal
    must name the missing lattice element, the Rust module to extend, the
@@ -211,15 +317,23 @@ Context loss, cross-file sanitizer propagation), you MUST perform a
    pair required to close the gap.
 
 You are **mathematically forbidden** from logging a capability gap in the bounty
-ledger without also proposing its automated cure in the innovation log. The bounty
-ledger records where the engine failed; the innovation log records how the engine
-will never fail there again. Both entries must be authored in the same session.
+or candidate ledger without also proposing its automated cure in the innovation
+log. The ledgers record where the engine failed; the innovation log records how
+the engine will never fail there again. Both entries must be authored in the
+same session.
 
 **Why this closes the Sprint Batch 95 instruction bleed**: Sprint Batch 95
 correctly applied Schema Taint Verification Law but failed to simultaneously
 author a P-tier proposal to automate the schema traversal. The Dual-Ledger
 Mandate makes that pairing structurally mandatory — a governance circuit breaker,
 not a soft reminder.
+
+### Cash-Flow Priority Override
+
+If a `P-tier` item in `.INNOVATION_LOG.md` was explicitly generated to solve a
+proof gap for a finding currently sitting in `tools/campaign/CANDIDATE_LEDGER.md`,
+it automatically outranks broader architectural features. The fastest path to a
+validated Bugcrowd submission is the absolute priority.
 
 ### Exploitation-Strategy-Gap Autonomous Logging Law (Sprint Batch 88)
 

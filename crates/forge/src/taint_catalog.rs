@@ -1973,6 +1973,366 @@ fn has_nontrivial_arg_scala(args_node: Node<'_>, source: &[u8]) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// P2-16 — Protobuf Any decode reachability (Go AST dominance)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// P2-16: Scan a Go source file for unguarded Protobuf Any decode call sites.
+///
+/// A call to `anypb.UnmarshalNew`, `ptypes.UnmarshalAny`, `jsonpb.Unmarshal`,
+/// or `proto.Unmarshal` is flagged **only** when it is NOT dominated in the AST
+/// by an `if_statement` or `expression_switch_statement` whose condition field
+/// references `TypeUrl`, `type_url`, or `typeUrl` — the canonical type-allowlist
+/// guard pattern in Go gRPC/HTTP gateway code.
+///
+/// **Dominance requirement**: the guard must structurally enclose the decode
+/// call in the AST (ancestor relationship), not merely appear elsewhere in the
+/// file.  This is a strict mathematical property — a guard in a sibling branch
+/// or in a different function does NOT suppress the finding.
+///
+/// Emits `security:protobuf_any_unguarded_decode` at severity `High`.
+///
+/// Only operates when `ext == "go"`.  Returns an empty vec for all other
+/// extensions (fail-open, no false positives).
+pub fn find_protobuf_any_reachability(
+    ext: &str,
+    source: &[u8],
+    file_path: &str,
+) -> Vec<common::slop::StructuredFinding> {
+    if ext != "go" {
+        return vec![];
+    }
+    if source.len() > 1024 * 1024 {
+        return vec![];
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
+        return vec![];
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return vec![];
+    };
+    let mut findings = Vec::new();
+    let mut ancestors: Vec<tree_sitter::Node<'_>> = Vec::new();
+    walk_protobuf_any_decode(
+        tree.root_node(),
+        source,
+        file_path,
+        &mut ancestors,
+        &mut findings,
+        0,
+    );
+    findings
+}
+
+/// Protobuf Any decode method names that unmarshal an arbitrary message type.
+const PROTOBUF_UNMARSHAL_METHODS: &[&str] = &["UnmarshalNew", "UnmarshalAny", "Unmarshal"];
+
+/// Package/receiver names whose `Unmarshal*` methods decode a `google.protobuf.Any`.
+const PROTOBUF_ANY_RECEIVERS: &[&str] = &["anypb", "ptypes", "jsonpb", "proto"];
+
+/// Byte patterns that identify a TypeUrl allowlist guard in an if/switch condition.
+const TYPEURL_NEEDLES: &[&[u8]] = &[b"TypeUrl", b"type_url", b"typeUrl", b"TypeURL"];
+
+fn walk_protobuf_any_decode<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &[u8],
+    file_path: &str,
+    ancestors: &mut Vec<tree_sitter::Node<'a>>,
+    findings: &mut Vec<common::slop::StructuredFinding>,
+    depth: u32,
+) {
+    if depth > 200 {
+        return;
+    }
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if func.kind() == "selector_expression" {
+                let receiver = func
+                    .child_by_field_name("operand")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let method = func
+                    .child_by_field_name("field")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                if PROTOBUF_ANY_RECEIVERS.contains(&receiver)
+                    && PROTOBUF_UNMARSHAL_METHODS.contains(&method)
+                    && !is_typeurl_guarded(ancestors, source)
+                {
+                    let line = source[..node.start_byte()]
+                        .iter()
+                        .filter(|&&b| b == b'\n')
+                        .count() as u32
+                        + 1;
+                    let digest = blake3::hash(
+                        source
+                            .get(node.start_byte()..node.end_byte())
+                            .unwrap_or(&[]),
+                    );
+                    let d = digest.as_bytes();
+                    let fp = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+                    findings.push(common::slop::StructuredFinding {
+                        id: "security:protobuf_any_unguarded_decode".to_string(),
+                        file: Some(file_path.to_string()),
+                        line: Some(line),
+                        fingerprint: format!("{fp:016x}"),
+                        severity: Some("High".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    // Push this node as an ancestor before recursing into children.
+    ancestors.push(node);
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        walk_protobuf_any_decode(child, source, file_path, ancestors, findings, depth + 1);
+    }
+    ancestors.pop();
+}
+
+/// Returns `true` when any ancestor `if_statement` or `expression_switch_statement`
+/// has a condition that references a TypeUrl allowlist guard.
+///
+/// Only the condition/value field of the guard node is checked — not its body —
+/// so a TypeUrl reference inside the body of the guarded block does not suppress
+/// a sibling unguarded decode call.
+fn is_typeurl_guarded(ancestors: &[tree_sitter::Node<'_>], source: &[u8]) -> bool {
+    for ancestor in ancestors.iter().rev() {
+        let condition_text: Option<&str> = match ancestor.kind() {
+            "if_statement" => ancestor
+                .child_by_field_name("condition")
+                .and_then(|n| n.utf8_text(source).ok()),
+            "expression_switch_statement" => ancestor
+                .child_by_field_name("value")
+                .and_then(|n| n.utf8_text(source).ok()),
+            _ => None,
+        };
+        let Some(text) = condition_text else {
+            continue;
+        };
+        if TYPEURL_NEEDLES
+            .iter()
+            .any(|needle| text.as_bytes().windows(needle.len()).any(|w| w == *needle))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2-7 — Public FFI unsafe dereference reachability (Rust AST)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// P2-7: Scan a Rust source file for `unsafe` raw-pointer dereferences in
+/// public functions whose pointers are sourced from `extern "C"` parameters or
+/// `CStr::from_ptr` calls.
+///
+/// **AST proof requirement (0-hop reachability)**: A finding is emitted when
+/// ALL of the following hold in the AST:
+/// 1. A `function_item` node carries a `pub` (or `pub(...)`) `visibility_modifier`.
+/// 2. At least one `parameter` of the function has a `pointer_type` annotation
+///    (`*mut T` or `*const T`), OR the function body contains `CStr::from_ptr`.
+/// 3. An `unsafe_block` exists within the function body.
+/// 4. Within that `unsafe_block`, a `unary_expression` node begins with `*`
+///    (raw pointer dereference operator).
+///
+/// Multi-hop reachability (up to 5 hops via call graph) is seeded from these
+/// 0-hop findings by the IFDS solver in `ifds.rs`.
+///
+/// Emits `security:public_ffi_unsafe_deref` at severity `High`.
+///
+/// Only operates when `ext == "rs"`.  Returns an empty vec for all other
+/// extensions (fail-open, no false positives).
+pub fn collect_rust_call_graph_edges(
+    ext: &str,
+    source: &[u8],
+    file_path: &str,
+) -> Vec<common::slop::StructuredFinding> {
+    if ext != "rs" {
+        return vec![];
+    }
+    if source.len() > 1024 * 1024 {
+        return vec![];
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return vec![];
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return vec![];
+    };
+    let mut findings = Vec::new();
+    walk_rust_ffi_functions(tree.root_node(), source, file_path, &mut findings, 0);
+    findings
+}
+
+fn walk_rust_ffi_functions(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    findings: &mut Vec<common::slop::StructuredFinding>,
+    depth: u32,
+) {
+    if depth > 200 {
+        return;
+    }
+    if node.kind() == "function_item" && rust_fn_is_public(node, source) {
+        let has_raw_ptr_param = rust_fn_has_raw_pointer_param(node, source);
+        let has_cstr_from_ptr = rust_fn_body_contains_cstr_from_ptr(node, source);
+        if has_raw_ptr_param || has_cstr_from_ptr {
+            if let Some(deref_line) = rust_fn_find_unsafe_deref(node, source) {
+                let digest = blake3::hash(
+                    source
+                        .get(node.start_byte()..node.end_byte())
+                        .unwrap_or(&[]),
+                );
+                let d = digest.as_bytes();
+                let fp = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+                findings.push(common::slop::StructuredFinding {
+                    id: "security:public_ffi_unsafe_deref".to_string(),
+                    file: Some(file_path.to_string()),
+                    line: Some(deref_line),
+                    fingerprint: format!("{fp:016x}"),
+                    severity: Some("High".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        walk_rust_ffi_functions(child, source, file_path, findings, depth + 1);
+    }
+}
+
+/// Returns `true` when `fn_node` carries a `pub` or `pub(...)` visibility modifier.
+fn rust_fn_is_public(fn_node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cur = fn_node.walk();
+    for child in fn_node.children(&mut cur) {
+        if child.kind() == "visibility_modifier" {
+            return child.utf8_text(source).unwrap_or("").starts_with("pub");
+        }
+    }
+    false
+}
+
+/// Returns `true` when any named parameter of `fn_node` has a `pointer_type`
+/// annotation (`*mut T` or `*const T`).
+fn rust_fn_has_raw_pointer_param(fn_node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(params) = fn_node.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cur = params.walk();
+    for child in params.named_children(&mut cur) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        if let Some(type_node) = child.child_by_field_name("type") {
+            if type_node.kind() == "pointer_type" {
+                return true;
+            }
+            let text = type_node.utf8_text(source).unwrap_or("");
+            if text.starts_with("*mut ") || text.starts_with("*const ") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` when the body of `fn_node` contains `CStr::from_ptr`
+/// (indicating a pointer sourced from a C caller).
+fn rust_fn_body_contains_cstr_from_ptr(fn_node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(body) = fn_node.child_by_field_name("body") else {
+        return false;
+    };
+    body.utf8_text(source)
+        .unwrap_or("")
+        .contains("CStr::from_ptr")
+}
+
+/// Returns the 1-indexed line of the first raw pointer dereference inside an
+/// `unsafe_block` descendant of `fn_node`, or `None` if no such deref exists.
+fn rust_fn_find_unsafe_deref(fn_node: tree_sitter::Node<'_>, source: &[u8]) -> Option<u32> {
+    let body = fn_node.child_by_field_name("body")?;
+    find_unsafe_deref_recursive(body, source, 0)
+}
+
+fn find_unsafe_deref_recursive(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: u32,
+) -> Option<u32> {
+    if depth > 100 {
+        return None;
+    }
+    if node.kind() == "unsafe_block" {
+        return find_raw_ptr_deref_in_unsafe(node, source, 0);
+    }
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if let Some(line) = find_unsafe_deref_recursive(child, source, depth + 1) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+/// Searches `node` (an `unsafe_block`) for evidence of a raw pointer dereference:
+/// - A `unary_expression` whose source text starts with `*` (explicit deref), OR
+/// - A call to `CStr::from_ptr` (which internally dereferences a C string pointer).
+fn find_raw_ptr_deref_in_unsafe(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: u32,
+) -> Option<u32> {
+    if depth > 100 {
+        return None;
+    }
+    if node.kind() == "unary_expression" {
+        let text = node.utf8_text(source).unwrap_or("");
+        if text.starts_with('*') {
+            let line = source[..node.start_byte()]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32
+                + 1;
+            return Some(line);
+        }
+    }
+    // `CStr::from_ptr(raw)` is semantically a raw pointer dereference —
+    // it reads a NUL-terminated C string at the given address without Rust's
+    // lifetime or bounds guarantees.
+    if node.kind() == "call_expression" {
+        let text = node.utf8_text(source).unwrap_or("");
+        if text.contains("CStr::from_ptr") || text.contains("from_ptr") {
+            let line = source[..node.start_byte()]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32
+                + 1;
+            return Some(line);
+        }
+    }
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if let Some(line) = find_raw_ptr_deref_in_unsafe(child, source, depth + 1) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2802,6 +3162,534 @@ def validate(payload):
         assert!(
             findings.is_empty(),
             "uncataloged Scala function must not produce cross-file finding"
+        );
+    }
+
+    // ── P2-16: Protobuf Any AST dominance tests ─────────────────────────────
+
+    /// TP: Go handler calls `anypb.UnmarshalNew` without a TypeUrl guard — must fire.
+    #[test]
+    fn protobuf_any_unguarded_decode_fires_without_typeurl_guard() {
+        let src = r#"package handler
+
+import "google.golang.org/protobuf/types/known/anypb"
+
+func Handle(input []byte) error {
+    var msg anypb.Any
+    return anypb.UnmarshalNew(&msg, proto.UnmarshalOptions{})
+}
+"#;
+        let findings = find_protobuf_any_reachability("go", src.as_bytes(), "handler/handler.go");
+        assert!(
+            !findings.is_empty(),
+            "unguarded anypb.UnmarshalNew must produce a finding"
+        );
+        assert_eq!(findings[0].id, "security:protobuf_any_unguarded_decode");
+        assert_eq!(findings[0].severity.as_deref(), Some("High"));
+    }
+
+    /// TN: Go handler calls `anypb.UnmarshalNew` inside an `if TypeUrl ==` guard — silent.
+    #[test]
+    fn protobuf_any_unguarded_decode_silent_with_typeurl_if_guard() {
+        let src = r#"package handler
+
+import "google.golang.org/protobuf/types/known/anypb"
+
+func Handle(msg *anypb.Any) error {
+    if msg.TypeUrl == "type.googleapis.com/foo.Bar" {
+        return anypb.UnmarshalNew(msg, proto.UnmarshalOptions{})
+    }
+    return errors.New("unknown type")
+}
+"#;
+        let findings = find_protobuf_any_reachability("go", src.as_bytes(), "handler/handler.go");
+        assert!(
+            findings.is_empty(),
+            "anypb.UnmarshalNew inside TypeUrl if-guard must be silent"
+        );
+    }
+
+    /// TN: Non-Go file — must be silent regardless of content.
+    #[test]
+    fn protobuf_any_reachability_ignores_non_go_extensions() {
+        let src = b"anypb.UnmarshalNew(msg, opts)";
+        let findings = find_protobuf_any_reachability("py", src, "handler.py");
+        assert!(
+            findings.is_empty(),
+            "non-Go file must never produce protobuf Any findings"
+        );
+    }
+
+    /// TN: ptypes.UnmarshalAny inside expression_switch_statement on TypeUrl — silent.
+    #[test]
+    fn protobuf_any_unguarded_decode_silent_with_typeurl_switch_guard() {
+        let src = r#"package handler
+
+func Handle(msg *any.Any) error {
+    switch msg.TypeUrl {
+    case "type.googleapis.com/foo.Bar":
+        return ptypes.UnmarshalAny(msg, &bar)
+    default:
+        return errors.New("unknown type")
+    }
+}
+"#;
+        let findings = find_protobuf_any_reachability("go", src.as_bytes(), "handler/handler.go");
+        assert!(
+            findings.is_empty(),
+            "ptypes.UnmarshalAny inside TypeUrl switch guard must be silent"
+        );
+    }
+
+    // ── P2-7: Public FFI unsafe dereference tests ────────────────────────────
+
+    /// TP: `pub fn` with `*mut u8` param dereferences inside `unsafe {}` — must fire.
+    #[test]
+    fn public_ffi_unsafe_deref_fires_on_pub_fn_with_raw_ptr_param() {
+        let src = r#"
+pub fn write_byte(ptr: *mut u8, val: u8) {
+    unsafe {
+        *ptr = val;
+    }
+}
+"#;
+        let findings = collect_rust_call_graph_edges("rs", src.as_bytes(), "src/ffi.rs");
+        assert!(
+            !findings.is_empty(),
+            "pub fn with *mut param and unsafe deref must produce a finding"
+        );
+        assert_eq!(findings[0].id, "security:public_ffi_unsafe_deref");
+        assert_eq!(findings[0].severity.as_deref(), Some("High"));
+    }
+
+    /// TN: Private `fn` with `*mut u8` param — not public, must be silent.
+    #[test]
+    fn public_ffi_unsafe_deref_silent_for_private_fn() {
+        let src = r#"
+fn internal_write(ptr: *mut u8, val: u8) {
+    unsafe {
+        *ptr = val;
+    }
+}
+"#;
+        let findings = collect_rust_call_graph_edges("rs", src.as_bytes(), "src/internal.rs");
+        assert!(
+            findings.is_empty(),
+            "private fn must not produce FFI unsafe deref finding"
+        );
+    }
+
+    /// TP: `pub fn` that calls `CStr::from_ptr` and dereferences in `unsafe {}` — must fire.
+    #[test]
+    fn public_ffi_unsafe_deref_fires_on_cstr_from_ptr() {
+        let src = r#"
+pub fn parse_name(raw: *const i8) -> &'static str {
+    unsafe {
+        let s = CStr::from_ptr(raw);
+        s.to_str().unwrap_or("")
+    }
+}
+"#;
+        let findings = collect_rust_call_graph_edges("rs", src.as_bytes(), "src/bridge.rs");
+        assert!(
+            !findings.is_empty(),
+            "pub fn with CStr::from_ptr inside unsafe must produce a finding"
+        );
+        assert_eq!(findings[0].id, "security:public_ffi_unsafe_deref");
+    }
+
+    /// TN: `pub fn` with `*mut u8` param but NO `unsafe` block — must be silent.
+    #[test]
+    fn public_ffi_unsafe_deref_silent_when_no_unsafe_block() {
+        let src = r#"
+pub fn safe_write(ptr: *mut u8, val: u8) {
+    // no unsafe block — pointer is not dereferenced
+    let _ = ptr;
+}
+"#;
+        let findings = collect_rust_call_graph_edges("rs", src.as_bytes(), "src/ffi_safe.rs");
+        assert!(
+            findings.is_empty(),
+            "pub fn with raw ptr param but no unsafe deref must be silent"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2-15 Phase A — CFG-Aware C Double-Free Witness
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single `free(ptr)` call site collected during AST walk.
+struct CFreeCall {
+    /// Name of the pointer argument (identifier text).
+    ptr_name: String,
+    /// Source byte offset of the `free(` call expression start.
+    offset: usize,
+    /// Start byte of the enclosing `compound_statement` (function body or inner block).
+    block_start: usize,
+    /// If inside an `if_statement` branch: `(if_start_byte, is_consequence)`.
+    /// `true` = consequence branch; `false` = alternative (else) branch.
+    branch_ctx: Option<(usize, bool)>,
+}
+
+/// Detects sequential double-free vulnerabilities in C source files using
+/// CFG-aware AST dominance analysis.
+///
+/// A double-free is reported when:
+/// - `free(p)` appears twice in the same compound_statement block.
+/// - The two calls are **not** in mutually exclusive branches (if/else).
+/// - No intervening `p = NULL` assignment or `return` statement separates them.
+///
+/// Emits `security:c_double_free` at `High` severity.
+pub fn find_c_double_free_witness(
+    ext: &str,
+    source: &[u8],
+    file_path: &str,
+) -> Vec<common::slop::StructuredFinding> {
+    if !matches!(ext, "c" | "h" | "cpp" | "cc" | "cxx") {
+        return Vec::new();
+    }
+    if source.len() > 1_048_576 {
+        return Vec::new();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let mut findings = Vec::new();
+    walk_c_double_free(root, source, file_path, &mut findings, 0);
+    findings
+}
+
+fn walk_c_double_free(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    findings: &mut Vec<common::slop::StructuredFinding>,
+    depth: usize,
+) {
+    if depth > 64 {
+        return;
+    }
+    if node.kind() == "function_definition" {
+        if let Some(body) = node.child_by_field_name("body") {
+            check_c_function_for_double_free(body, source, file_path, findings);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_c_double_free(child, source, file_path, findings, depth + 1);
+    }
+}
+
+fn check_c_function_for_double_free(
+    body: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    findings: &mut Vec<common::slop::StructuredFinding>,
+) {
+    let mut calls: Vec<CFreeCall> = Vec::new();
+    collect_c_free_calls(body, source, None, None, &mut calls, 0);
+
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let names: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        calls
+            .iter()
+            .filter(|c| seen.insert(c.ptr_name.clone()))
+            .map(|c| c.ptr_name.clone())
+            .collect()
+    };
+
+    for name in names {
+        if reported.contains(&name) {
+            continue;
+        }
+        let same: Vec<&CFreeCall> = calls.iter().filter(|c| c.ptr_name == name).collect();
+        if same.len() < 2 {
+            continue;
+        }
+        'outer: for ai in 0..same.len() {
+            for bi in ai + 1..same.len() {
+                let a = same[ai];
+                let b = same[bi];
+
+                // Branch exclusivity: safe when both are in the SAME if_statement
+                // but in opposite branches (consequence vs alternative).
+                if let (Some((if_a, cons_a)), Some((if_b, cons_b))) = (a.branch_ctx, b.branch_ctx) {
+                    if if_a == if_b && cons_a != cons_b {
+                        continue; // Mutually exclusive — safe.
+                    }
+                }
+
+                // Sequential block check: same compound_statement with no guard.
+                if a.block_start == b.block_start {
+                    let (first, second) = if a.offset < b.offset {
+                        (a.offset, b.offset)
+                    } else {
+                        (b.offset, a.offset)
+                    };
+                    if c_has_null_or_return_guard(body, source, &name, first, second) {
+                        continue;
+                    }
+                    let line = (source[..first]
+                        .iter()
+                        .filter(|&&byte| byte == b'\n')
+                        .count()
+                        + 1) as u32;
+                    findings.push(common::slop::StructuredFinding {
+                        id: "security:c_double_free".to_string(),
+                        severity: Some("High".to_string()),
+                        remediation: Some(format!(
+                            "`free({name})` called twice on the same sequential execution path \
+                             without an intervening null-assignment or return; set `{name} = NULL;` \
+                             after the first free to make the second call a safe no-op."
+                        )),
+                        file: Some(file_path.to_string()),
+                        line: Some(line),
+                        ..Default::default()
+                    });
+                    reported.insert(name.clone());
+                    break 'outer;
+                }
+            }
+        }
+    }
+}
+
+/// Recursively collects all `free(<identifier>)` call sites inside `node`,
+/// tracking the enclosing block and branch context.
+fn collect_c_free_calls(
+    node: Node<'_>,
+    source: &[u8],
+    block_start: Option<usize>,
+    branch_ctx: Option<(usize, bool)>,
+    calls: &mut Vec<CFreeCall>,
+    depth: usize,
+) {
+    if depth > 128 {
+        return;
+    }
+    match node.kind() {
+        "compound_statement" => {
+            let new_block = node.start_byte();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_c_free_calls(child, source, Some(new_block), branch_ctx, calls, depth + 1);
+            }
+        }
+        "if_statement" => {
+            let if_start = node.start_byte();
+            if let Some(cons) = node.child_by_field_name("consequence") {
+                collect_c_free_calls(
+                    cons,
+                    source,
+                    block_start,
+                    Some((if_start, true)),
+                    calls,
+                    depth + 1,
+                );
+            }
+            if let Some(alt) = node.child_by_field_name("alternative") {
+                // In tree-sitter-c, `alternative` is an `else_clause` with a `body` field.
+                if let Some(alt_body) = alt.child_by_field_name("body") {
+                    collect_c_free_calls(
+                        alt_body,
+                        source,
+                        block_start,
+                        Some((if_start, false)),
+                        calls,
+                        depth + 1,
+                    );
+                } else {
+                    let mut cursor = alt.walk();
+                    for child in alt.children(&mut cursor) {
+                        if child.is_named() {
+                            collect_c_free_calls(
+                                child,
+                                source,
+                                block_start,
+                                Some((if_start, false)),
+                                calls,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        "call_expression" => {
+            if let Some(ptr_name) = extract_c_free_arg(node, source) {
+                if let Some(block) = block_start {
+                    calls.push(CFreeCall {
+                        ptr_name,
+                        offset: node.start_byte(),
+                        block_start: block,
+                        branch_ctx,
+                    });
+                }
+            }
+            // Do not recurse into the call's own arguments.
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_c_free_calls(child, source, block_start, branch_ctx, calls, depth + 1);
+            }
+        }
+    }
+}
+
+/// Extracts the pointer argument name from a `free(<identifier>)` call expression.
+/// Returns `None` if the function is not `free` or the argument is not a plain identifier.
+fn extract_c_free_arg(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let func = node.child_by_field_name("function")?;
+    if func.utf8_text(source).ok()? != "free" {
+        return None;
+    }
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for arg in args.children(&mut cursor) {
+        if arg.kind() == "identifier" {
+            return arg.utf8_text(source).ok().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Returns `true` if the AST between `start` and `end` byte offsets contains
+/// either a `p = NULL`/`p = 0` assignment or a `return` statement — either of
+/// which makes the second `free(p)` unreachable or safe.
+fn c_has_null_or_return_guard(
+    root: Node<'_>,
+    source: &[u8],
+    ptr_name: &str,
+    start: usize,
+    end: usize,
+) -> bool {
+    c_guard_in_range(root, source, ptr_name, start, end, 0)
+}
+
+fn c_guard_in_range(
+    node: Node<'_>,
+    source: &[u8],
+    ptr_name: &str,
+    start: usize,
+    end: usize,
+    depth: usize,
+) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let ns = node.start_byte();
+    let ne = node.end_byte();
+    if ne <= start || ns >= end {
+        return false;
+    }
+    match node.kind() {
+        "assignment_expression" => {
+            let lhs = node
+                .child_by_field_name("left")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let rhs = node
+                .child_by_field_name("right")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            if lhs == ptr_name && matches!(rhs, "NULL" | "null" | "nullptr" | "0") {
+                return true;
+            }
+        }
+        "return_statement" => {
+            if ns > start && ns < end {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if c_guard_in_range(child, source, ptr_name, start, end, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod double_free_tests {
+    use super::find_c_double_free_witness;
+
+    /// TP: Sequential `free(p); ... free(p);` in same block — must fire.
+    #[test]
+    fn c_double_free_sequential_fires() {
+        let src = r#"
+void vuln(char *p) {
+    free(p);
+    process(p);
+    free(p);
+}
+"#;
+        let findings = find_c_double_free_witness("c", src.as_bytes(), "src/vuln.c");
+        assert!(
+            !findings.is_empty(),
+            "sequential free(p); free(p); must produce a double-free finding"
+        );
+        assert_eq!(findings[0].id, "security:c_double_free");
+        assert_eq!(findings[0].severity.as_deref(), Some("High"));
+    }
+
+    /// TN: `free(p)` in if-consequence + `free(p)` in else — branch exclusive, must be silent.
+    #[test]
+    fn c_double_free_silent_for_if_else_branches() {
+        let src = r#"
+void safe_branch(char *p, int flag) {
+    if (flag) {
+        free(p);
+    } else {
+        free(p);
+    }
+}
+"#;
+        let findings = find_c_double_free_witness("c", src.as_bytes(), "src/safe.c");
+        assert!(
+            findings.is_empty(),
+            "if/else branch-exclusive free(p) must not produce a double-free finding"
+        );
+    }
+
+    /// TN: Intervening `p = NULL` guard between two `free(p)` calls — must be silent.
+    #[test]
+    fn c_double_free_silent_when_null_guard_present() {
+        let src = r#"
+void guarded(char *p) {
+    free(p);
+    p = NULL;
+    free(p);
+}
+"#;
+        let findings = find_c_double_free_witness("c", src.as_bytes(), "src/guarded.c");
+        assert!(
+            findings.is_empty(),
+            "free(p); p = NULL; free(p); must not produce a double-free finding"
+        );
+    }
+
+    /// TN: Non-C extension must return no findings.
+    #[test]
+    fn c_double_free_silent_for_non_c_ext() {
+        let src = b"free(p); free(p);";
+        let findings = find_c_double_free_witness("rs", src, "src/lib.rs");
+        assert!(
+            findings.is_empty(),
+            "non-C extension must not be analyzed for double-free"
         );
     }
 }
